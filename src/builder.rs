@@ -27,6 +27,14 @@ impl Asm {
         self.push_word(slot).sstore()
     }
 
+    pub fn add(&mut self) -> &mut Self {
+        self.add_op(Op::Add)
+    }
+
+    pub fn keccak256(&mut self) -> &mut Self {
+        self.add_op(Op::Keccak256)
+    }
+
     pub fn return_word(&mut self) -> &mut Self {
         self.push_u8(0x00) // stack: [value, 0]
             .add_op(Op::MStore) // MSTORE pops 0-offset then value -> mem[0..32]=value, stack = []
@@ -49,6 +57,16 @@ impl Asm {
             .push_u8(0x40)
             .push_u8(0x00)
             .add_op(Op::Keccak256)
+    }
+
+    pub fn array_elem_slot(&mut self, base: U256) -> &mut Self {
+        self.push_word(base)
+            .push_u8(0x00)
+            .mstore()
+            .push_u8(0x20)
+            .push_u8(0x00)
+            .keccak256()
+            .add()
     }
 
     pub fn msg_sender(&mut self) -> &mut Self {

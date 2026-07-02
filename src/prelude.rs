@@ -18,6 +18,36 @@ impl<K, V> Mapping<K, V> {
     }
 }
 
+pub struct Array<T> {
+    _marker: core::marker::PhantomData<T>,
+}
+
+impl<T> Array<T> {
+    pub fn get(&self, _index: U256) -> T {
+        unimplemented!(
+            "Rulidity: storage exists only on-chain. This is stub impl for rust analyzer"
+        )
+    }
+
+    pub fn len(&self) -> U256 {
+        unimplemented!(
+            "Rulidity: storage exists only on-chain. This is stub impl for rust analyzer"
+        )
+    }
+
+    pub fn push(&mut self, _value: T) {
+        unimplemented!(
+            "Rulidity: storage exists only on-chain. This is stub impl for rust analyzer"
+        )
+    }
+
+    pub fn set(&mut self, _index: U256, _value: T) {
+        unimplemented!(
+            "Rulidity: storage exists only on-chain. This is stub impl for rust analyzer"
+        )
+    }
+}
+
 pub fn msg_sender() -> Address {
     unimplemented!("Rulidity: msg.sender exists only on-chain. This is stub impl for rust analyzer")
 }

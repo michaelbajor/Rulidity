@@ -18,7 +18,20 @@ struct EventDef {
     fields: Vec<EventField>,
 }
 
-/// `#[contract] mod my_contract { ... }`
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FieldKind {
+    Scalar,
+    Mapping,
+    Array,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct StorageField {
+    slot: usize,
+    kind: FieldKind,
+}
+
+/// #[contract] mod my_contract { ... }
 #[proc_macro_attribute]
 pub fn contract(_attr: TokenStream, item: TokenStream) -> TokenStream {
     let module: ItemMod = parse_macro_input!(item as ItemMod);
@@ -75,9 +88,15 @@ pub fn contract(_attr: TokenStream, item: TokenStream) -> TokenStream {
     }
 
     // assign storage slots by declaration order
-    let mut storage_slots = HashMap::new();
-    for (slot_id, (ident, _ty)) in storage_fields.iter().enumerate() {
-        storage_slots.insert(ident.clone().unwrap(), slot_id);
+    let mut storage: HashMap<syn::Ident, StorageField> = HashMap::new();
+    for (slot_id, (ident, ty)) in storage_fields.iter().enumerate() {
+        storage.insert(
+            ident.clone().unwrap(),
+            StorageField {
+                slot: slot_id,
+                kind: field_kind_of(ty),
+            },
+        );
     }
 
     // one `build_*` fn per external fn, lowered from its body
@@ -86,7 +105,7 @@ pub fn contract(_attr: TokenStream, item: TokenStream) -> TokenStream {
         .map(|(name, output, block, inputs)| {
             let build_ident = format_ident!("build_{}", name);
             let offsets = param_offset(params_of(inputs.clone()));
-            let body = lower_block(block, output, &storage_slots, &offsets, &events);
+            let body = lower_block(block, output, &storage, &offsets, &events);
             quote! {
                 fn #build_ident(asm: &mut ::rulidity::asm::Asm) {
                     #body
@@ -135,7 +154,7 @@ fn has_attr(attrs: &[syn::Attribute], name: &str) -> bool {
     attrs.iter().any(|attr| attr.path().is_ident(name))
 }
 
-/// Clone an item and remove the `#[storage]` / `#[external]` helper attributes,
+/// Clone an item and remove the #[storage] / #[external] helper attributes,
 /// so it re-emits as ordinary (type-checkable) Rust.
 fn strip_helper_attrs(item: &Item) -> proc_macro2::TokenStream {
     let mut item = item.clone();
@@ -143,7 +162,7 @@ fn strip_helper_attrs(item: &Item) -> proc_macro2::TokenStream {
         Item::Struct(s) => {
             s.attrs
                 .retain(|a| !a.path().is_ident("storage") && !a.path().is_ident("event"));
-            // `#[indexed]` lives on the event's fields, strip those too
+            // #[indexed] lives on the event's fields, strip that too, for now
             for field in &mut s.fields {
                 field.attrs.retain(|a| !a.path().is_ident("indexed"));
             }
@@ -163,7 +182,7 @@ fn strip_helper_attrs(item: &Item) -> proc_macro2::TokenStream {
 fn lower_block(
     block: &syn::Block,
     output: &syn::ReturnType,
-    slots: &HashMap<syn::Ident, usize>,
+    storage: &HashMap<syn::Ident, StorageField>,
     param_offsets: &HashMap<String, u32>,
     events: &HashMap<String, EventDef>,
 ) -> proc_macro2::TokenStream {
@@ -174,7 +193,7 @@ fn lower_block(
 
     let body = lower_stmts(
         &block.stmts,
-        slots,
+        storage,
         param_offsets,
         &mut locals,
         &mut next_local,
@@ -198,7 +217,7 @@ fn lower_block(
 /// @todo this is a horribly long and convoluted function. It might be a good idea to spread the code into function
 fn lower_stmts(
     stmts: &[syn::Stmt],
-    slots: &HashMap<syn::Ident, usize>,
+    storage: &HashMap<syn::Ident, StorageField>,
     param_offsets: &HashMap<String, u32>,
     locals: &mut HashMap<String, u32>,
     next_local: &mut u32,
@@ -216,8 +235,8 @@ fn lower_stmts(
                 // self.field = rhs;
                 syn::Expr::Assign(assign) => match &*assign.left {
                     syn::Expr::Field(f) if is_self(&f.base) => {
-                        let slot = member_slot(&f.member, slots);
-                        let rhs = lower_expression(&assign.right, slots, param_offsets, locals);
+                        let slot = member_slot(&f.member, storage);
+                        let rhs = lower_expression(&assign.right, storage, param_offsets, locals);
                         parts.push(quote! {
                             #rhs
                             asm.store_slot(::rulidity::U256::from(#slot));
@@ -233,7 +252,7 @@ fn lower_stmts(
                 },
                 // self.map.insert(key, value);
                 syn::Expr::MethodCall(mc) if mc.method == "insert" => {
-                    let base = self_field_slot(&mc.receiver, slots);
+                    let base = self_field_slot(&mc.receiver, storage);
                     let args: Vec<&syn::Expr> = mc.args.iter().collect();
                     if args.len() != 2 {
                         parts.push(
@@ -241,8 +260,8 @@ fn lower_stmts(
                                 .to_compile_error(),
                         );
                     } else {
-                        let value = lower_expression(args[1], slots, param_offsets, locals); // value first (stays underneath)
-                        let key = lower_expression(args[0], slots, param_offsets, locals); // then key (mapping_slot eats it)
+                        let value = lower_expression(args[1], storage, param_offsets, locals); // value first (stays underneath)
+                        let key = lower_expression(args[0], storage, param_offsets, locals); // then key (mapping_slot eats it)
                         parts.push(quote! {
                             #value
                             #key
@@ -251,9 +270,70 @@ fn lower_stmts(
                         });
                     }
                 }
+                // self.array.set(idx, val)
+                syn::Expr::MethodCall(mc) if mc.method == "set" => {
+                    let sf = self_field(&mc.receiver, storage);
+                    let base = sf.slot as u64;
+                    let args: Vec<&syn::Expr> = mc.args.iter().collect();
+                    if sf.kind != FieldKind::Array {
+                        parts.push(
+                            syn::Error::new_spanned(
+                                mc,
+                                "rulidity: .set() is only valid on an Array field",
+                            )
+                            .to_compile_error(),
+                        );
+                    } else if args.len() != 2 {
+                        parts.push(
+                            syn::Error::new_spanned(mc, "rulidity: set takes (index, value)")
+                                .to_compile_error(),
+                        );
+                    } else {
+                        let value = lower_expression(args[1], storage, param_offsets, locals);
+                        let index = lower_expression(args[0], storage, param_offsets, locals);
+                        parts.push(quote! {
+                            #value
+                            #index
+                            asm.array_elem_slot(::rulidity::U256::from(#base));
+                            asm.sstore();
+                        });
+                    }
+                }
+                // self.array.push(val)
+                syn::Expr::MethodCall(mc) if mc.method == "push" => {
+                    let sf = self_field(&mc.receiver, storage);
+                    let base = sf.slot as u64;
+                    let args: Vec<&syn::Expr> = mc.args.iter().collect();
+                    if sf.kind != FieldKind::Array {
+                        parts.push(
+                            syn::Error::new_spanned(
+                                mc,
+                                "rulidity: .push() is only valid on an Array field",
+                            )
+                            .to_compile_error(),
+                        );
+                    } else if args.len() != 1 {
+                        parts.push(
+                            syn::Error::new_spanned(mc, "rulidity: push takes (value)")
+                                .to_compile_error(),
+                        );
+                    } else {
+                        let value = lower_expression(args[0], storage, param_offsets, locals);
+                        parts.push(quote! {
+                            #value
+                            asm.load_slot(::rulidity::U256::from(#base));
+                            asm.array_elem_slot(::rulidity::U256::from(#base));
+                            asm.sstore();
+                            asm.load_slot(::rulidity::U256::from(#base));
+                            asm.push_word(::rulidity::U256::from(1u64));
+                            asm.add_op(::rulidity::asm::Op::Add);
+                            asm.store_slot(::rulidity::U256::from(#base));
+                        });
+                    }
+                }
                 syn::Expr::Call(call) if is_path(&call.func, "require") => {
                     // require calls
-                    let cond = lower_expression(&call.args[0], slots, param_offsets, locals);
+                    let cond = lower_expression(&call.args[0], storage, param_offsets, locals);
                     parts.push(quote! {
                         #cond
                         {
@@ -298,7 +378,7 @@ fn lower_stmts(
                             });
                             match fv {
                                 Some(fv) => {
-                                    lower_expression(&fv.expr, slots, param_offsets, locals)
+                                    lower_expression(&fv.expr, storage, param_offsets, locals)
                                 }
                                 None => syn::Error::new_spanned(
                                     expr_struct,
@@ -341,10 +421,10 @@ fn lower_stmts(
                     });
                 }
                 syn::Expr::If(if_expr) => {
-                    let cond = lower_expression(&if_expr.cond, slots, param_offsets, locals);
+                    let cond = lower_expression(&if_expr.cond, storage, param_offsets, locals);
                     let then_body = lower_stmts(
                         &if_expr.then_branch.stmts,
-                        slots,
+                        storage,
                         param_offsets,
                         locals,
                         next_local,
@@ -370,7 +450,7 @@ fn lower_stmts(
 
                             let else_body = lower_stmts(
                                 else_stmts,
-                                slots,
+                                storage,
                                 param_offsets,
                                 locals,
                                 next_local,
@@ -408,7 +488,7 @@ fn lower_stmts(
                 }
                 // trailing expression is the return value
                 _ if is_last && has_return && semi.is_none() => {
-                    let e = lower_expression(expr, slots, param_offsets, locals);
+                    let e = lower_expression(expr, storage, param_offsets, locals);
                     parts.push(quote! {
                         #e
                         asm.return_word();
@@ -429,7 +509,7 @@ fn lower_stmts(
                         .to_compile_error();
                 };
 
-                let value = lower_expression(&init, slots, param_offsets, locals);
+                let value = lower_expression(&init, storage, param_offsets, locals);
                 let offset = *next_local;
                 *next_local += 0x20;
                 locals.insert(name.to_string(), offset);
@@ -452,7 +532,7 @@ fn lower_stmts(
 
 fn lower_expression(
     expr: &syn::Expr,
-    slots: &HashMap<syn::Ident, usize>,
+    storage: &HashMap<syn::Ident, StorageField>,
     param_offsets: &HashMap<String, u32>,
     locals: &HashMap<String, u32>,
 ) -> proc_macro2::TokenStream {
@@ -467,27 +547,56 @@ fn lower_expression(
         }
         // self.field loads that field's storage slot
         syn::Expr::Field(field) if is_self(&field.base) => {
-            let slot = member_slot(&field.member, slots);
+            let slot = member_slot(&field.member, storage);
             quote! { asm.load_slot(::rulidity::U256::from(#slot)); }
         }
-        // self.map.get(key)
+        // self.map.get(key) or self.array.get(idx)
         syn::Expr::MethodCall(mc) if mc.method == "get" => {
-            let base = self_field_slot(&mc.receiver, slots);
+            let sf = self_field(&mc.receiver, storage);
+            let base = sf.slot as u64;
             let args: Vec<&syn::Expr> = mc.args.iter().collect();
             if args.len() != 1 {
-                return syn::Error::new_spanned(mc, "rulidity: get takes (key)").to_compile_error();
+                return syn::Error::new_spanned(mc, "rulidity: get takes one argument")
+                    .to_compile_error();
             }
-            let key = lower_expression(args[0], slots, param_offsets, locals);
+            let arg = lower_expression(args[0], storage, param_offsets, locals);
+            match sf.kind {
+                FieldKind::Mapping => quote! {
+                    #arg
+                    asm.mapping_slot(::rulidity::U256::from(#base));
+                    asm.sload();
+                },
+                FieldKind::Array => quote! {
+                    #arg
+                    asm.array_elem_slot(::rulidity::U256::from(#base));
+                    asm.sload();
+                },
+                FieldKind::Scalar => syn::Error::new_spanned(
+                    mc,
+                    "rulidity: .get() is only valid on a Mapping or Array field",
+                )
+                .to_compile_error(),
+            }
+        }
+        // self.array.len()
+        syn::Expr::MethodCall(mc) if mc.method == "len" => {
+            let sf = self_field(&mc.receiver, storage);
+            let base = sf.slot as u64;
+            if sf.kind != FieldKind::Array {
+                return syn::Error::new_spanned(
+                    mc,
+                    "rulidity: .len() is only valid on an Array field",
+                )
+                .to_compile_error();
+            }
             quote! {
-                #key
-                asm.mapping_slot(::rulidity::U256::from(#base));
-                asm.sload();
+                asm.load_slot(::rulidity::U256::from(#base));
             }
         }
         // arithmetic and comparison operators
         syn::Expr::Binary(bin) => {
-            let l = lower_expression(&bin.left, slots, param_offsets, locals);
-            let r = lower_expression(&bin.right, slots, param_offsets, locals);
+            let l = lower_expression(&bin.left, storage, param_offsets, locals);
+            let r = lower_expression(&bin.right, storage, param_offsets, locals);
             match &bin.op {
                 syn::BinOp::Add(_) => quote! { #l #r asm.add_op(::rulidity::asm::Op::Add); },
                 syn::BinOp::Mul(_) => quote! { #l #r asm.add_op(::rulidity::asm::Op::Mul); },
@@ -519,7 +628,7 @@ fn lower_expression(
             }
         }
         // (expr)
-        syn::Expr::Paren(p) => lower_expression(&p.expr, slots, param_offsets, locals),
+        syn::Expr::Paren(p) => lower_expression(&p.expr, storage, param_offsets, locals),
         // msg_sender()  or  U256::from(<int>)
         syn::Expr::Call(call) => {
             if let syn::Expr::Path(p) = &*call.func
@@ -562,16 +671,29 @@ fn is_self(e: &syn::Expr) -> bool {
     is_path(e, "self")
 }
 
-fn member_slot(m: &syn::Member, slots: &HashMap<syn::Ident, usize>) -> u64 {
+fn member_slot(m: &syn::Member, storage: &HashMap<syn::Ident, StorageField>) -> u64 {
     match m {
-        syn::Member::Named(ident) => *slots.get(ident).expect("unknown storage field") as u64,
+        syn::Member::Named(ident) => storage.get(ident).expect("unknown storage field").slot as u64,
         syn::Member::Unnamed(_) => panic!("tuple fields not supported"),
     }
 }
 
-fn self_field_slot(left: &syn::Expr, slots: &HashMap<syn::Ident, usize>) -> u64 {
+fn self_field<'a>(
+    receiver: &syn::Expr,
+    storage: &'a HashMap<syn::Ident, StorageField>,
+) -> &'a StorageField {
+    match receiver {
+        syn::Expr::Field(f) if is_self(&f.base) => match &f.member {
+            syn::Member::Named(id) => storage.get(id).expect("unknown storage field"),
+            syn::Member::Unnamed(_) => panic!("tuple fields not supported"),
+        },
+        _ => panic!("expected self.<field>"),
+    }
+}
+
+fn self_field_slot(left: &syn::Expr, storage: &HashMap<syn::Ident, StorageField>) -> u64 {
     match left {
-        syn::Expr::Field(f) if is_self(&f.base) => member_slot(&f.member, slots),
+        syn::Expr::Field(f) if is_self(&f.base) => member_slot(&f.member, storage),
         _ => panic!("expected self.<field>"),
     }
 }
@@ -670,4 +792,17 @@ fn param_offset(params: Vec<(syn::Ident, syn::Type)>) -> HashMap<String, u32> {
     }
 
     map
+}
+
+fn field_kind_of(ty: &syn::Type) -> FieldKind {
+    let type_str = match ty {
+        syn::Type::Path(type_path) => &type_path.path.segments.last().unwrap().ident.to_string(),
+        _ => panic!("This type cannot be converted to FieldKind"),
+    };
+
+    match type_str.as_str() {
+        "Mapping" => FieldKind::Mapping,
+        "Array" => FieldKind::Array,
+        _ => FieldKind::Scalar,
+    }
 }
