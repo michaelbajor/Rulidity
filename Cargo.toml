@@ -1,0 +1,14 @@
+[package]
+name = "rulidity"
+version = "0.1.0"
+edition = "2024"
+
+[workspace]
+members = [".", "macro"]
+
+[dependencies]
+alloy-primitives = "1.6.0"
+rulidity-macro = { path = "macro" }
+
+[dev-dependencies]
+revm = "41.0.0"
