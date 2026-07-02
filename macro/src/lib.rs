@@ -2,9 +2,10 @@ use std::collections::HashMap;
 
 use proc_macro::TokenStream;
 use quote::{format_ident, quote};
-use syn::{FnArg, Ident, ImplItem, Item, ItemMod, Pat, parse_macro_input, token::Comma};
+use syn::{FnArg, ImplItem, Item, ItemMod, Pat, parse_macro_input, token::Comma};
 
 #[derive(Debug, Clone)]
+#[allow(dead_code)] // temporary until indexed fields are implemented properly
 struct EventField {
     name: String,
     ty: syn::Type,
@@ -57,15 +58,15 @@ pub fn contract(_attr: TokenStream, item: TokenStream) -> TokenStream {
             }
             Item::Impl(imp) => {
                 for impl_item in &imp.items {
-                    if let ImplItem::Fn(m) = impl_item {
-                        if has_attr(&m.attrs, "external") {
-                            external_functions.push((
-                                m.sig.ident.clone(),
-                                m.sig.output.clone(),
-                                m.block.clone(),
-                                m.sig.inputs.clone(),
-                            ));
-                        }
+                    if let ImplItem::Fn(m) = impl_item
+                        && has_attr(&m.attrs, "external")
+                    {
+                        external_functions.push((
+                            m.sig.ident.clone(),
+                            m.sig.output.clone(),
+                            m.block.clone(),
+                            m.sig.inputs.clone(),
+                        ));
                     }
                 }
             }
@@ -173,7 +174,6 @@ fn lower_block(
 
     let body = lower_stmts(
         &block.stmts,
-        output,
         slots,
         param_offsets,
         &mut locals,
@@ -198,7 +198,6 @@ fn lower_block(
 /// @todo this is a horribly long and convoluted function. It might be a good idea to spread the code into function
 fn lower_stmts(
     stmts: &[syn::Stmt],
-    output: &syn::ReturnType,
     slots: &HashMap<syn::Ident, usize>,
     param_offsets: &HashMap<String, u32>,
     locals: &mut HashMap<String, u32>,
@@ -345,7 +344,6 @@ fn lower_stmts(
                     let cond = lower_expression(&if_expr.cond, slots, param_offsets, locals);
                     let then_body = lower_stmts(
                         &if_expr.then_branch.stmts,
-                        output,
                         slots,
                         param_offsets,
                         locals,
@@ -372,7 +370,6 @@ fn lower_stmts(
 
                             let else_body = lower_stmts(
                                 else_stmts,
-                                output,
                                 slots,
                                 param_offsets,
                                 locals,
@@ -432,7 +429,7 @@ fn lower_stmts(
                         .to_compile_error();
                 };
 
-                let value = lower_expression(&*init, slots, param_offsets, locals);
+                let value = lower_expression(&init, slots, param_offsets, locals);
                 let offset = *next_local;
                 *next_local += 0x20;
                 locals.insert(name.to_string(), offset);
@@ -525,10 +522,10 @@ fn lower_expression(
         syn::Expr::Paren(p) => lower_expression(&p.expr, slots, param_offsets, locals),
         // msg_sender()  or  U256::from(<int>)
         syn::Expr::Call(call) => {
-            if let syn::Expr::Path(p) = &*call.func {
-                if p.path.is_ident("msg_sender") {
-                    return quote! { asm.msg_sender(); };
-                }
+            if let syn::Expr::Path(p) = &*call.func
+                && p.path.is_ident("msg_sender")
+            {
+                return quote! { asm.msg_sender(); };
             }
             lower_from_call(call)
         }
@@ -591,15 +588,15 @@ fn ident_of_pat(pat: syn::Pat) -> syn::Ident {
 fn lower_from_call(call: &syn::ExprCall) -> proc_macro2::TokenStream {
     if let syn::Expr::Path(p) = &*call.func {
         let is_from = p.path.segments.last().is_some_and(|s| s.ident == "from");
-        if is_from && call.args.len() == 1 {
-            if let syn::Expr::Lit(syn::ExprLit {
+        if is_from
+            && call.args.len() == 1
+            && let syn::Expr::Lit(syn::ExprLit {
                 lit: syn::Lit::Int(int),
                 ..
             }) = &call.args[0]
-            {
-                let v: u64 = int.base10_parse().unwrap();
-                return quote! { asm.push_word(::rulidity::U256::from(#v)); };
-            }
+        {
+            let v: u64 = int.base10_parse().unwrap();
+            return quote! { asm.push_word(::rulidity::U256::from(#v)); };
         }
     }
     syn::Error::new_spanned(call, "rulidity: unsupported call").to_compile_error()
@@ -630,8 +627,7 @@ fn abi_type_of(ty: syn::Type) -> String {
     let type_str = match ty {
         syn::Type::Path(type_path) => {
             let path = type_path.path;
-            let last_segment = path.segments.last().unwrap().clone().ident;
-            last_segment
+            path.segments.last().unwrap().clone().ident
         }
         _ => panic!("Unsupported type"),
     };
@@ -657,9 +653,9 @@ fn signature_string(name: String, params: Vec<(syn::Ident, syn::Type)>) -> Strin
         .collect();
     let args_str = types.join(",");
     let mut func_signature = name;
-    func_signature.push_str("(");
+    func_signature.push('(');
     func_signature.push_str(&args_str);
-    func_signature.push_str(")");
+    func_signature.push(')');
 
     func_signature
 }

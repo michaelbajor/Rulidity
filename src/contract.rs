@@ -22,11 +22,9 @@ pub struct Builder;
 impl Builder {
     pub fn selector(&self, sig: &str) -> [u8; 4] {
         let hash = keccak256(sig);
-        let func_selector = hash[0..4]
+        hash[0..4]
             .try_into()
-            .expect("keccak256 did not calculate hash");
-
-        func_selector
+            .expect("keccak256 did not calculate hash")
     }
 
     fn build_runtime(&self, functions: Vec<Function>) -> Asm {
@@ -137,7 +135,7 @@ mod tests {
 
         let bytecode = builder.assemble_contract(funcs);
 
-        let bytecode_bytes = bytecode.try_into().unwrap();
+        let bytecode_bytes = bytecode.into();
 
         let caller = Address::from([0x10u8; 20]);
         let mut evm = Context::mainnet()

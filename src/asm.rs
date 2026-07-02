@@ -115,6 +115,7 @@ impl Op {
     }
 }
 
+#[derive(Default, Debug, Clone)]
 pub struct Asm {
     ops: Vec<Op>,
     next_label: Label,
@@ -151,7 +152,7 @@ impl Asm {
         let bytes_trimmed_zeros = bytes
             .iter()
             .skip_while(|&&byte| byte == 0)
-            .map(|byte| *byte)
+            .copied()
             .collect::<Vec<u8>>();
 
         self.add_op(Op::Push(bytes_trimmed_zeros));

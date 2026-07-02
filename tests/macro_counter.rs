@@ -9,6 +9,7 @@ mod counter {
 
     impl Counter {
         #[external]
+        #[allow(clippy::assign_op_pattern)] // this is deliberate here to make sure macro works on those cases as well
         fn increment(&mut self) {
             self.count = self.count + U256::from(1);
         }
