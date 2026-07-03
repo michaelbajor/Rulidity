@@ -1,0 +1,52 @@
+use std::collections::HashMap;
+
+#[derive(Debug, Clone)]
+#[allow(dead_code)] // temporary until indexed fields are implemented properly
+pub(crate) struct EventField {
+    pub(crate) name: String,
+    pub(crate) ty: syn::Type,
+    pub(crate) indexed: bool,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct EventDef {
+    pub(crate) name: String,
+    pub(crate) fields: Vec<EventField>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FieldKind {
+    Scalar,
+    Mapping,
+    Array,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct StorageField {
+    pub(crate) slot: usize,
+    pub(crate) kind: FieldKind,
+}
+
+/// Everything that stays constant while lowering a whole contract.
+pub(crate) struct Ctx<'a> {
+    pub(crate) storage: &'a HashMap<syn::Ident, StorageField>,
+    pub(crate) events: &'a HashMap<String, EventDef>,
+}
+
+/// Per function body state. `locals` and `param_offsets` describe the current
+/// scope, `next_local` hands out fresh memory slots as we descend.
+pub(crate) struct Lower<'a> {
+    pub(crate) ctx: &'a Ctx<'a>,
+    pub(crate) locals: HashMap<String, u32>,
+    pub(crate) param_offsets: HashMap<String, u32>,
+    pub(crate) next_local: u32,
+}
+
+impl Lower<'_> {
+    /// Reserve a 32 byte memory slot, above the 0x00-0x40 scratchpad.
+    pub(crate) fn alloc_local(&mut self) -> u32 {
+        let offset = self.next_local;
+        self.next_local += 0x20;
+        offset
+    }
+}
