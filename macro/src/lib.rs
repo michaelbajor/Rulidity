@@ -96,20 +96,24 @@ pub fn contract(_attr: TokenStream, item: TokenStream) -> TokenStream {
 
     // assign storage slots by declaration order
     let mut storage: HashMap<syn::Ident, StorageField> = HashMap::new();
+    let mut field_types: HashMap<syn::Ident, syn::Type> = HashMap::new();
     for (slot_id, (ident, ty)) in storage_fields.iter().enumerate() {
+        let ident = ident.clone().unwrap();
         storage.insert(
-            ident.clone().unwrap(),
+            ident.clone(),
             StorageField {
                 slot: slot_id,
                 kind: field_kind_of(ty),
             },
         );
+        field_types.insert(ident, ty.clone());
     }
 
     let ctx = Ctx {
         storage: &storage,
         events: &events,
         internal_functions: &internal_functions,
+        field_types: &field_types,
     };
 
     let constructor_build = match &constructor {

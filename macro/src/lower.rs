@@ -250,20 +250,30 @@ fn lower_assign(assign: &syn::ExprAssign, state: &mut Lower) -> proc_macro2::Tok
     }
 }
 
-/// self.map.insert(key, value);
+/// self.map.insert(key, value); including nested maps, e.g.
+/// self.allowances.get(owner).insert(spender, amount);
 fn lower_mapping_insert(mc: &syn::ExprMethodCall, state: &mut Lower) -> proc_macro2::TokenStream {
-    let base = self_field_slot(&mc.receiver, state.ctx.storage);
     let args: Vec<&syn::Expr> = mc.args.iter().collect();
     if args.len() != 2 {
         return syn::Error::new_spanned(mc, "rulidity: insert takes (key, value)")
             .to_compile_error();
     }
+    // the receiver is the mapping being written to; resolve its base slot
+    let (base_code, base_ty) = match lower_place(&mc.receiver, state) {
+        Ok(place) => place,
+        Err(e) => return e,
+    };
+    if !matches!(ty_kind(&base_ty), TyKind::Mapping(_)) {
+        return syn::Error::new_spanned(mc, "rulidity: .insert() is only valid on a Mapping")
+            .to_compile_error();
+    }
     let value = lower_expression(args[1], state); // value first (stays underneath)
-    let key = lower_expression(args[0], state); // then key (mapping_slot eats it)
+    let key = lower_expression(args[0], state);
     quote! {
         #value
+        #base_code
         #key
-        asm.mapping_slot(::rulidity::U256::from(#base));
+        asm.mapping_slot_from_stack();
         asm.sstore();
     }
 }
@@ -509,31 +519,145 @@ fn lower_expression(expr: &syn::Expr, state: &mut Lower) -> proc_macro2::TokenSt
     }
 }
 
-/// self.map.get(key) or self.array.get(idx)
+/// self.map.get(key) / self.array.get(idx), including nested chains like
+/// self.allowances.get(owner).get(spender). Reads the resolved slot.
 fn lower_get(mc: &syn::ExprMethodCall, state: &mut Lower) -> proc_macro2::TokenStream {
-    let sf = *self_field(&mc.receiver, state.ctx.storage);
-    let base = sf.slot as u64;
-    let args: Vec<&syn::Expr> = mc.args.iter().collect();
-    if args.len() != 1 {
-        return syn::Error::new_spanned(mc, "rulidity: get takes one argument").to_compile_error();
+    let place = syn::Expr::MethodCall(mc.clone());
+    match lower_place(&place, state) {
+        Ok((slot_code, value_ty)) => match ty_kind(&value_ty) {
+            TyKind::Scalar => quote! {
+                #slot_code
+                asm.sload();
+            },
+            _ => syn::Error::new_spanned(
+                mc,
+                "rulidity: .get() must resolve to a scalar value to read",
+            )
+            .to_compile_error(),
+        },
+        Err(e) => e,
     }
-    let arg = lower_expression(args[0], state);
-    match sf.kind {
-        FieldKind::Mapping => quote! {
-            #arg
-            asm.mapping_slot(::rulidity::U256::from(#base));
-            asm.sload();
-        },
-        FieldKind::Array => quote! {
-            #arg
-            asm.array_elem_slot(::rulidity::U256::from(#base));
-            asm.sload();
-        },
-        FieldKind::Scalar => syn::Error::new_spanned(
-            mc,
-            "rulidity: .get() is only valid on a Mapping or Array field",
-        )
-        .to_compile_error(),
+}
+
+/// What a storage value at a resolved slot is, and its inner type for peeling.
+enum TyKind {
+    Scalar,
+    Mapping(syn::Type), // value type V of Mapping<K, V>
+    Array(syn::Type),   // element type T of Array<T>
+}
+
+/// Classify a declared field / peeled value type by its outer path segment.
+fn ty_kind(ty: &syn::Type) -> TyKind {
+    if let syn::Type::Path(tp) = ty
+        && let Some(seg) = tp.path.segments.last()
+    {
+        match seg.ident.to_string().as_str() {
+            "Mapping" => {
+                if let Some(v) = nth_generic_arg(seg, 1) {
+                    return TyKind::Mapping(v);
+                }
+            }
+            "Array" => {
+                if let Some(t) = nth_generic_arg(seg, 0) {
+                    return TyKind::Array(t);
+                }
+            }
+            _ => {}
+        }
+    }
+    TyKind::Scalar
+}
+
+/// The n-th angle-bracketed type argument of a path segment, e.g. arg 1 of
+/// `Mapping<Address, U256>` is `U256`.
+fn nth_generic_arg(seg: &syn::PathSegment, n: usize) -> Option<syn::Type> {
+    if let syn::PathArguments::AngleBracketed(ab) = &seg.arguments {
+        ab.args
+            .iter()
+            .filter_map(|a| match a {
+                syn::GenericArgument::Type(t) => Some(t.clone()),
+                _ => None,
+            })
+            .nth(n)
+    } else {
+        None
+    }
+}
+
+/// Emit code that leaves a storage slot on the stack, and return the value type
+/// living at that slot (so a further `.get` knows whether it is another level).
+/// Handles `self.field` and any chain of `.get(key)` on top of it.
+fn lower_place(
+    expr: &syn::Expr,
+    state: &mut Lower,
+) -> Result<(proc_macro2::TokenStream, syn::Type), proc_macro2::TokenStream> {
+    match expr {
+        // self.field -> the field's base slot, typed by its declaration
+        syn::Expr::Field(f) if is_self(&f.base) => {
+            let ident = match &f.member {
+                syn::Member::Named(id) => id,
+                syn::Member::Unnamed(_) => {
+                    return Err(
+                        syn::Error::new_spanned(f, "tuple fields not supported").to_compile_error()
+                    );
+                }
+            };
+            let slot = match state.ctx.storage.get(ident) {
+                Some(sf) => sf.slot as u64,
+                None => {
+                    return Err(
+                        syn::Error::new_spanned(f, "unknown storage field").to_compile_error()
+                    );
+                }
+            };
+            let ty = match state.ctx.field_types.get(ident) {
+                Some(t) => t.clone(),
+                None => {
+                    return Err(
+                        syn::Error::new_spanned(f, "unknown storage field").to_compile_error()
+                    );
+                }
+            };
+            Ok((quote! { asm.push_word(::rulidity::U256::from(#slot)); }, ty))
+        }
+        // receiver.get(key) -> combine the receiver's slot with the key
+        syn::Expr::MethodCall(mc) if mc.method == "get" => {
+            if mc.args.len() != 1 {
+                return Err(
+                    syn::Error::new_spanned(mc, "rulidity: get takes one argument")
+                        .to_compile_error(),
+                );
+            }
+            let (base_code, base_ty) = lower_place(&mc.receiver, state)?;
+            let key = lower_expression(&mc.args[0], state);
+            match ty_kind(&base_ty) {
+                TyKind::Mapping(v) => Ok((
+                    quote! {
+                        #base_code
+                        #key
+                        asm.mapping_slot_from_stack();
+                    },
+                    v,
+                )),
+                TyKind::Array(t) => Ok((
+                    quote! {
+                        #base_code
+                        #key
+                        asm.array_elem_slot_from_stack();
+                    },
+                    t,
+                )),
+                TyKind::Scalar => Err(syn::Error::new_spanned(
+                    mc,
+                    "rulidity: .get() is only valid on a Mapping or Array",
+                )
+                .to_compile_error()),
+            }
+        }
+        _ => Err(
+            syn::Error::new_spanned(expr, "rulidity: unsupported storage access")
+                .to_compile_error(),
+        ),
     }
 }
 
@@ -633,13 +757,6 @@ fn self_field<'a>(
             syn::Member::Named(id) => storage.get(id).expect("unknown storage field"),
             syn::Member::Unnamed(_) => panic!("tuple fields not supported"),
         },
-        _ => panic!("expected self.<field>"),
-    }
-}
-
-fn self_field_slot(left: &syn::Expr, storage: &HashMap<syn::Ident, StorageField>) -> u64 {
-    match left {
-        syn::Expr::Field(f) if is_self(&f.base) => member_slot(&f.member, storage),
         _ => panic!("expected self.<field>"),
     }
 }

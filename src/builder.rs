@@ -69,6 +69,31 @@ impl Asm {
             .add()
     }
 
+    /// keccak256(key ++ base) with base and key both taken from the stack, so
+    /// the base can itself be a computed slot (nested mappings).
+    /// stack: [base, key] -> [slot]
+    pub fn mapping_slot_from_stack(&mut self) -> &mut Self {
+        self.push_u8(0x00)
+            .mstore() // mem[0..32] = key
+            .push_u8(0x20)
+            .mstore() // mem[32..64] = base
+            .push_u8(0x40)
+            .push_u8(0x00)
+            .keccak256()
+    }
+
+    /// keccak256(base) + index with base and index both taken from the stack.
+    /// stack: [base, index] -> [slot]
+    pub fn array_elem_slot_from_stack(&mut self) -> &mut Self {
+        self.add_op(Op::Swap(1)) // [index, base]
+            .push_u8(0x00)
+            .mstore() // mem[0..32] = base
+            .push_u8(0x20)
+            .push_u8(0x00)
+            .keccak256() // [index, keccak(base)]
+            .add()
+    }
+
     pub fn pop(&mut self) -> &mut Self {
         self.add_op(Op::Pop)
     }
@@ -166,6 +191,26 @@ mod tests {
 
         let generated = hex::encode(asm.finish());
         assert_eq!(generated, "60005260016020526040600020");
+    }
+
+    #[test]
+    fn mapping_slot_from_stack_works() {
+        let mut asm = Asm::new();
+
+        asm.mapping_slot_from_stack();
+
+        let generated = hex::encode(asm.finish());
+        assert_eq!(generated, "6000526020526040600020");
+    }
+
+    #[test]
+    fn array_elem_slot_from_stack_works() {
+        let mut asm = Asm::new();
+
+        asm.array_elem_slot_from_stack();
+
+        let generated = hex::encode(asm.finish());
+        assert_eq!(generated, "90600052602060002001");
     }
 
     #[test]

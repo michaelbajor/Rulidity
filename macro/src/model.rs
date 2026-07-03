@@ -39,6 +39,9 @@ pub(crate) struct Ctx<'a> {
     pub(crate) storage: &'a HashMap<syn::Ident, StorageField>,
     pub(crate) events: &'a HashMap<String, EventDef>,
     pub(crate) internal_functions: &'a HashMap<String, InternalFn>,
+    // declared type of each storage field, so mapping/array chains can be
+    // peeled a level at a time (e.g. Mapping<K, Mapping<K2, V>>)
+    pub(crate) field_types: &'a HashMap<syn::Ident, syn::Type>,
 }
 
 /// Per function body state. `locals` and `param_offsets` describe the current
