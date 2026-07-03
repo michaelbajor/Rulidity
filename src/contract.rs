@@ -60,19 +60,21 @@ impl Builder {
         asm
     }
 
-    fn wrap_with_constructor(&self, runtime_bytecode: Vec<u8>) -> Vec<u8> {
+    fn wrap_with_constructor(&self, constructor: Vec<u8>, runtime_bytecode: Vec<u8>) -> Vec<u8> {
         let code_size = runtime_bytecode.len();
 
         debug_assert!(code_size <= 0xFFFF);
 
-        let init_len = 15usize; // constant because size & offset use PUSH2
+        let epilogue_len = 15usize; // constant because size & offset use PUSH2
+        let init_len = constructor.len() + epilogue_len;
         let offset = init_len;
 
         let [size_hi, size_lo] = (code_size as u16).to_be_bytes();
         let [off_hi, off_lo] = (offset as u16).to_be_bytes();
 
+        let mut init_code = constructor;
         // codecopy(destOffest, offset, size) = push size, offset, dest(0)
-        let mut init_code = vec![
+        init_code.extend_from_slice(&[
             0x61, size_hi, size_lo, // PUSH2 size
             0x61, off_hi, off_lo, // PUSH2 offset
             0x60, 0x00, // PUSH1 0
@@ -80,7 +82,7 @@ impl Builder {
             0x61, size_hi, size_lo, // PUSH2 size (for return)
             0x60, 0x00, // PUSH1 0
             0xF3, // RETURN
-        ];
+        ]);
 
         init_code.extend_from_slice(&runtime_bytecode);
         debug_assert!(init_code.len() == init_len + code_size);
@@ -88,9 +90,27 @@ impl Builder {
         init_code
     }
 
-    pub fn assemble_contract(&self, functions: Vec<Function>) -> Vec<u8> {
+    // assemble constructor logic. If there is no custom constructor, all it does is
+    // copy the code (init_code) from wrap_with_constructor
+    fn build_constructor(&self, constructor: Option<fn(&mut Asm)>) -> Vec<u8> {
+        match constructor {
+            Some(build_constr_func) => {
+                let mut asm = Asm::new();
+                build_constr_func(&mut asm);
+                asm.finish()
+            }
+            None => Vec::new(),
+        }
+    }
+
+    pub fn assemble_contract(
+        &self,
+        functions: Vec<Function>,
+        constructor: Option<fn(&mut Asm)>,
+    ) -> Vec<u8> {
         let runtime = self.build_runtime(functions).finish();
-        self.wrap_with_constructor(runtime)
+        let constructor = self.build_constructor(constructor);
+        self.wrap_with_constructor(constructor, runtime)
     }
 }
 
@@ -133,7 +153,7 @@ mod tests {
             },
         ];
 
-        let bytecode = builder.assemble_contract(funcs);
+        let bytecode = builder.assemble_contract(funcs, None);
 
         let bytecode_bytes = bytecode.into();
 

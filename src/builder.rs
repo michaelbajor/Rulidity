@@ -69,6 +69,18 @@ impl Asm {
             .add()
     }
 
+    pub fn code_size(&mut self) -> &mut Self {
+        self.add_op(Op::CodeSize)
+    }
+
+    pub fn code_copy(&mut self) -> &mut Self {
+        self.add_op(Op::CodeCopy)
+    }
+
+    pub fn sub(&mut self) -> &mut Self {
+        self.add_op(Op::Sub)
+    }
+
     pub fn msg_sender(&mut self) -> &mut Self {
         self.add_op(Op::Caller)
     }

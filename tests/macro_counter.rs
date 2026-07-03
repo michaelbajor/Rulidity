@@ -1,6 +1,6 @@
 #[rulidity::contract]
 mod counter {
-    use alloy_primitives::U256;
+    use rulidity::prelude::*;
 
     #[storage]
     struct Counter {

@@ -14,6 +14,8 @@ use abi::{
 use lower::lower_block;
 use model::{Ctx, EventDef, EventField, StorageField};
 
+use crate::lower::lower_constructor;
+
 /// #[contract] mod my_contract { ... }
 #[proc_macro_attribute]
 pub fn contract(_attr: TokenStream, item: TokenStream) -> TokenStream {
@@ -25,6 +27,11 @@ pub fn contract(_attr: TokenStream, item: TokenStream) -> TokenStream {
     let mut external_functions = Vec::new();
 
     let mut events: HashMap<String, EventDef> = HashMap::new();
+
+    let mut constructor: Option<(
+        syn::Block,
+        syn::punctuated::Punctuated<syn::FnArg, syn::token::Comma>,
+    )> = None;
 
     for item in &items {
         match item {
@@ -54,15 +61,20 @@ pub fn contract(_attr: TokenStream, item: TokenStream) -> TokenStream {
             }
             Item::Impl(imp) => {
                 for impl_item in &imp.items {
-                    if let ImplItem::Fn(m) = impl_item
-                        && has_attr(&m.attrs, "external")
-                    {
-                        external_functions.push((
-                            m.sig.ident.clone(),
-                            m.sig.output.clone(),
-                            m.block.clone(),
-                            m.sig.inputs.clone(),
-                        ));
+                    if let ImplItem::Fn(m) = impl_item {
+                        if has_attr(&m.attrs, "external") {
+                            external_functions.push((
+                                m.sig.ident.clone(),
+                                m.sig.output.clone(),
+                                m.block.clone(),
+                                m.sig.inputs.clone(),
+                            ));
+                        } else if has_attr(&m.attrs, "constructor") {
+                            if constructor.is_some() {
+                                panic!("Only one constructor is allowed");
+                            }
+                            constructor = Some((m.block.clone(), m.sig.inputs.clone()));
+                        }
                     }
                 }
             }
@@ -85,6 +97,26 @@ pub fn contract(_attr: TokenStream, item: TokenStream) -> TokenStream {
     let ctx = Ctx {
         storage: &storage,
         events: &events,
+    };
+
+    let constructor_build = match &constructor {
+        Some((block, inputs)) => {
+            let params = params_of(inputs.clone());
+            let body = lower_constructor(block, &params, &ctx);
+
+            quote! {
+                fn build_constructor(asm: &mut ::rulidity::asm::Asm) {
+                    #body
+                }
+            }
+        }
+        None => quote! {},
+    };
+
+    let ctor_arg = if constructor.is_some() {
+        quote! { ::std::option::Option::Some(build_constructor as fn(&mut ::rulidity::asm::Asm)) }
+    } else {
+        quote! { ::std::option::Option::None }
     };
 
     // one `build_*` fn per external fn, lowered from its body
@@ -152,6 +184,16 @@ pub fn contract(_attr: TokenStream, item: TokenStream) -> TokenStream {
             def.name
         ));
     }
+    if let Some((_, inputs)) = &constructor {
+        let inputs_json = params_of(inputs.clone())
+            .iter()
+            .map(|(id, ty)| abi_param_json(&id.to_string(), ty, None))
+            .collect::<Vec<_>>()
+            .join(",");
+        abi_entries.push(format!(
+            r#"{{"type":"constructor","inputs":[{inputs_json}],"stateMutability":"nonpayable"}}"#
+        ));
+    }
     let abi_str = format!("[{}]", abi_entries.join(","));
 
     // re-emit the user's items as real Rust, minus the helper attributes
@@ -167,10 +209,12 @@ pub fn contract(_attr: TokenStream, item: TokenStream) -> TokenStream {
             pub fn deploy_code() -> ::std::vec::Vec<u8> {
                 let builder = ::rulidity::contract::Builder;
                 let funcs = ::std::vec![#(#function_inits),*];
-                builder.assemble_contract(funcs)
+                builder.assemble_contract(funcs, #ctor_arg)
             }
 
             pub fn abi_json() -> &'static str { #abi_str }
+
+            #constructor_build
 
             #(#build_fns)*
         }
@@ -200,7 +244,9 @@ fn strip_helper_attrs(item: &Item) -> proc_macro2::TokenStream {
         Item::Impl(imp) => {
             for impl_item in &mut imp.items {
                 if let ImplItem::Fn(f) = impl_item {
-                    f.attrs.retain(|a| !a.path().is_ident("external"));
+                    f.attrs.retain(|a| {
+                        !a.path().is_ident("external") && !a.path().is_ident("constructor")
+                    });
                 }
             }
         }

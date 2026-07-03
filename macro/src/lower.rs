@@ -32,6 +32,49 @@ pub(crate) fn lower_block<'a>(
     quote! { #body #halt }
 }
 
+/// Lower a constructor body. Args are appended after a creation code at deployment time.
+/// Each arg is CODECOPY'd from the code tail into a local slot and then used as local
+/// Runs in place at offset 0 and can't halt.
+pub(crate) fn lower_constructor<'a>(
+    block: &syn::Block,
+    params: &[(syn::Ident, syn::Type)],
+    ctx: &'a Ctx<'a>,
+) -> proc_macro2::TokenStream {
+    let mut state = Lower {
+        ctx,
+        locals: HashMap::new(),
+        param_offsets: HashMap::new(),
+        next_local: 0x80,
+    };
+
+    let n = params.len() as u64;
+
+    let mut prologue: Vec<proc_macro2::TokenStream> = Vec::new();
+
+    for (i, (name, _ty)) in params.iter().enumerate() {
+        let slot = state.alloc_local();
+        state.locals.insert(name.to_string(), slot);
+
+        // arg i lives at CODESIZE - 32 * (n - 1)
+        let back = (n - i as u64) * 32;
+        prologue.push(quote! {
+            asm.push_word(::rulidity::U256::from(32u64)); // length
+            asm.push_word(::rulidity::U256::from(#back)); // 32 * (n - 1)
+            asm.code_size(); // CODESIZE
+            asm.sub();  // CODESIZE - 32 * (n - 1)
+            asm.push_word(::rulidity::U256::from(#slot)); // dest (local slot)
+            asm.code_copy();
+        });
+    }
+
+    let body = lower_stmts(&block.stmts, &mut state, false);
+
+    quote! {
+        #(#prologue)*
+        #body
+    }
+}
+
 /// Lower a slice of statements. The shared `Lower` state threads locals across
 /// nested blocks (`if` bodies) so they allocate fresh slots and stay visible.
 /// Never emits the trailing STOP, that's `lower_block`'s job.
