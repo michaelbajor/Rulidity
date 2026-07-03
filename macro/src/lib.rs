@@ -126,6 +126,46 @@ pub fn contract(_attr: TokenStream, item: TokenStream) -> TokenStream {
         })
         .collect();
 
+    let mut abi_entries: Vec<String> = external_functions
+        .iter()
+        .map(|(name, output, _block, inputs)| {
+            let inputs_json = params_of(inputs.clone())
+                .iter()
+                .map(|(id, ty)| abi_param_json(&id.to_string(), ty, None))
+                .collect::<Vec<_>>()
+                .join(",");
+
+            let outputs_json = match output {
+                syn::ReturnType::Default => String::new(),
+                syn::ReturnType::Type(_, ty) => abi_param_json("", ty, None),
+            };
+            let mutability = if is_mut_receiver(inputs) {
+                "nonpayable"
+            } else {
+                "view"
+            };
+
+            format!(
+                r#"{{"type":"function","name":"{name}","inputs":[{inputs_json}],"outputs":[{outputs_json}],"stateMutability":"{mutability}"}}"#
+            )
+        })
+        .collect();
+    let mut evs: Vec<&EventDef> = events.values().collect();
+    evs.sort_by(|first, second| first.name.cmp(&second.name));
+    for def in evs {
+        let inputs_json = def
+            .fields
+            .iter()
+            .map(|f| abi_param_json(&f.name, &f.ty, Some(f.indexed)))
+            .collect::<Vec<_>>()
+            .join(",");
+        abi_entries.push(format!(
+            r#"{{"type":"event","name":"{}","inputs":[{inputs_json}],"anonymous":false}}"#,
+            def.name
+        ));
+    }
+    let abi_str = format!("[{}]", abi_entries.join(","));
+
     // re-emit the user's items as real Rust, minus the helper attributes
     let real_items: Vec<proc_macro2::TokenStream> = items.iter().map(strip_helper_attrs).collect();
 
@@ -141,6 +181,8 @@ pub fn contract(_attr: TokenStream, item: TokenStream) -> TokenStream {
                 let funcs = ::std::vec![#(#function_inits),*];
                 builder.assemble_contract(funcs)
             }
+
+            pub fn abi_json() -> &'static str { #abi_str }
 
             #(#build_fns)*
         }
@@ -805,4 +847,18 @@ fn field_kind_of(ty: &syn::Type) -> FieldKind {
         "Array" => FieldKind::Array,
         _ => FieldKind::Scalar,
     }
+}
+
+fn abi_param_json(name: &str, ty: &syn::Type, indexed: Option<bool>) -> String {
+    let t = abi_type_of(ty.clone());
+    match indexed {
+        Some(idx) => {
+            format!(r#"{{"name":"{name}","type":"{t}","indexed":{idx},"internalType":"{t}"}}"#)
+        }
+        None => format!(r#"{{"name":"{name}","type":"{t}","internalType":"{t}"}}"#),
+    }
+}
+
+fn is_mut_receiver(inputs: &syn::punctuated::Punctuated<FnArg, Comma>) -> bool {
+    matches!(inputs.first(), Some(FnArg::Receiver(r)) if r.mutability.is_some())
 }
