@@ -29,7 +29,7 @@ mod erc20 {
 
     impl ERC20 {
         #[constructor]
-        fn new(&mut self, total_supply: U256) {
+        fn construct(&mut self, total_supply: U256) {
             self.total_supply = total_supply;
             self.balances.insert(msg_sender(), total_supply);
         }

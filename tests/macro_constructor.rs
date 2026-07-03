@@ -10,7 +10,7 @@ mod constructor_contract {
 
     impl ConstructorContract {
         #[constructor]
-        fn new(&mut self, owner: Address, start: U256) {
+        fn construct(&mut self, owner: Address, start: U256) {
             self.owner = owner;
             self.count = start;
         }
