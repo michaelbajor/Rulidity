@@ -172,7 +172,7 @@ pub fn contract(_attr: TokenStream, item: TokenStream) -> TokenStream {
     let mod_name = &module.ident;
 
     let expanded = quote! {
-        #[allow(dead_code)]
+        #[allow(dead_code, non_snake_case)]
         mod #mod_name {
             #(#real_items)*
 
