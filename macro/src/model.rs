@@ -21,6 +21,13 @@ pub(crate) enum FieldKind {
     Array,
 }
 
+#[derive(Debug, Clone)]
+pub(crate) struct InternalFn {
+    pub(crate) params: Vec<(syn::Ident, syn::Type)>,
+    pub(crate) output: syn::ReturnType,
+    pub(crate) block: syn::Block,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct StorageField {
     pub(crate) slot: usize,
@@ -31,6 +38,7 @@ pub(crate) struct StorageField {
 pub(crate) struct Ctx<'a> {
     pub(crate) storage: &'a HashMap<syn::Ident, StorageField>,
     pub(crate) events: &'a HashMap<String, EventDef>,
+    pub(crate) internal_functions: &'a HashMap<String, InternalFn>,
 }
 
 /// Per function body state. `locals` and `param_offsets` describe the current
@@ -40,6 +48,7 @@ pub(crate) struct Lower<'a> {
     pub(crate) locals: HashMap<String, u32>,
     pub(crate) param_offsets: HashMap<String, u32>,
     pub(crate) next_local: u32,
+    pub(crate) call_stack: Vec<String>, // recursion guard
 }
 
 impl Lower<'_> {

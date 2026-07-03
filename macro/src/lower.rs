@@ -5,6 +5,17 @@ use quote::{format_ident, quote};
 use crate::abi::signature_string;
 use crate::model::{Ctx, FieldKind, Lower, StorageField};
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Tail {
+    Return,
+    Leave,
+    Void,
+}
+
+fn returns(output: &syn::ReturnType) -> bool {
+    matches!(output, syn::ReturnType::Type(..))
+}
+
 pub(crate) fn lower_block<'a>(
     block: &syn::Block,
     output: &syn::ReturnType,
@@ -18,9 +29,12 @@ pub(crate) fn lower_block<'a>(
         locals: HashMap::new(),
         param_offsets,
         next_local: 0x80, // above 0x00-0x40 scratchpad
+        call_stack: Vec::new(),
     };
 
-    let body = lower_stmts(&block.stmts, &mut state, has_return);
+    let tail = if has_return { Tail::Return } else { Tail::Void };
+
+    let body = lower_stmts(&block.stmts, &mut state, tail);
 
     // fn with no return must halt, else it falls into the next body
     let halt = if !has_return {
@@ -45,6 +59,7 @@ pub(crate) fn lower_constructor<'a>(
         locals: HashMap::new(),
         param_offsets: HashMap::new(),
         next_local: 0x80,
+        call_stack: Vec::new(),
     };
 
     let n = params.len() as u64;
@@ -67,7 +82,7 @@ pub(crate) fn lower_constructor<'a>(
         });
     }
 
-    let body = lower_stmts(&block.stmts, &mut state, false);
+    let body = lower_stmts(&block.stmts, &mut state, Tail::Void);
 
     quote! {
         #(#prologue)*
@@ -78,11 +93,7 @@ pub(crate) fn lower_constructor<'a>(
 /// Lower a slice of statements. The shared `Lower` state threads locals across
 /// nested blocks (`if` bodies) so they allocate fresh slots and stay visible.
 /// Never emits the trailing STOP, that's `lower_block`'s job.
-fn lower_stmts(
-    stmts: &[syn::Stmt],
-    state: &mut Lower,
-    has_return: bool,
-) -> proc_macro2::TokenStream {
+fn lower_stmts(stmts: &[syn::Stmt], state: &mut Lower, tail: Tail) -> proc_macro2::TokenStream {
     let n = stmts.len();
     let mut parts: Vec<proc_macro2::TokenStream> = Vec::new();
 
@@ -90,8 +101,12 @@ fn lower_stmts(
         let is_last = i + 1 == n;
         let part = match stmt {
             syn::Stmt::Expr(expr, semi) => {
-                let is_return = is_last && has_return && semi.is_none();
-                lower_expr_stmt(expr, is_return, state)
+                let stmt_tail = if is_last && semi.is_none() {
+                    tail
+                } else {
+                    Tail::Void
+                };
+                lower_expr_stmt(expr, stmt_tail, state)
             }
             syn::Stmt::Local(local) => lower_local(local, state),
             other => {
@@ -106,27 +121,116 @@ fn lower_stmts(
 
 /// Dispatch a single expression statement to the right lowering. A trailing
 /// expression with no semicolon in a fn that returns is the return value.
-fn lower_expr_stmt(
-    expr: &syn::Expr,
-    is_return: bool,
-    state: &mut Lower,
-) -> proc_macro2::TokenStream {
+fn lower_expr_stmt(expr: &syn::Expr, tail: Tail, state: &mut Lower) -> proc_macro2::TokenStream {
     match expr {
-        syn::Expr::Assign(assign) => lower_assign(assign, state),
-        syn::Expr::MethodCall(mc) if mc.method == "insert" => lower_mapping_insert(mc, state),
-        syn::Expr::MethodCall(mc) if mc.method == "set" => lower_array_set(mc, state),
-        syn::Expr::MethodCall(mc) if mc.method == "push" => lower_array_push(mc, state),
-        syn::Expr::Call(call) if is_path(&call.func, "require") => lower_require(call, state),
-        syn::Expr::Call(call) if is_path(&call.func, "emit") => lower_emit(call, state),
-        syn::Expr::If(if_expr) => lower_if(if_expr, state),
-        _ if is_return => {
+        syn::Expr::Assign(assign) => return lower_assign(assign, state),
+        syn::Expr::MethodCall(mc) if mc.method == "insert" => {
+            return lower_mapping_insert(mc, state);
+        }
+        syn::Expr::MethodCall(mc) if mc.method == "set" => return lower_array_set(mc, state),
+        syn::Expr::MethodCall(mc) if mc.method == "push" => return lower_array_push(mc, state),
+        syn::Expr::Call(call) if is_path(&call.func, "require") => {
+            return lower_require(call, state);
+        }
+        syn::Expr::Call(call) if is_path(&call.func, "emit") => return lower_emit(call, state),
+        syn::Expr::If(if_expr) => return lower_if(if_expr, state),
+        syn::Expr::MethodCall(mc)
+            if matches!(tail, Tail::Void)
+                && is_self(&mc.receiver)
+                && state
+                    .ctx
+                    .internal_functions
+                    .contains_key(&mc.method.to_string()) =>
+        {
+            return lower_internal_call(mc, false, state);
+        }
+        _ => {}
+    }
+
+    // otherwise it's a value expression in tail position
+    match tail {
+        Tail::Return => {
             let e = lower_expression(expr, state);
             quote! {
                 #e
                 asm.return_word();
             }
         }
-        _ => syn::Error::new_spanned(expr, "rulidity: unsupported statement").to_compile_error(),
+        Tail::Leave => lower_expression(expr, state),
+        Tail::Void => {
+            syn::Error::new_spanned(expr, "Rulidity: unsupported statement").to_compile_error()
+        }
+    }
+}
+
+fn lower_internal_call(
+    mc: &syn::ExprMethodCall,
+    want_value: bool,
+    state: &mut Lower,
+) -> proc_macro2::TokenStream {
+    let name = mc.method.to_string();
+
+    if state.call_stack.contains(&name) {
+        return syn::Error::new_spanned(mc, "Rulidity: recursive internal calls are not supported")
+            .to_compile_error();
+    }
+
+    let (params, block, output) = {
+        let f = state
+            .ctx
+            .internal_functions
+            .get(&name)
+            .expect("Shouldn't fail, guarded by caller");
+        (f.params.clone(), f.block.clone(), f.output.clone())
+    };
+
+    if mc.args.len() != params.len() {
+        return syn::Error::new_spanned(mc, "Rulidity: wrong number of arguments")
+            .to_compile_error();
+    }
+
+    // Eval each arg in caller's scope and store it in a fresh local var
+    let mut binds = Vec::new();
+    let mut param_local: HashMap<String, u32> = HashMap::new();
+
+    for ((pname, _), arg) in params.iter().zip(mc.args.iter()) {
+        let v = lower_expression(arg, state);
+        let slot = state.alloc_local();
+        param_local.insert(pname.to_string(), slot);
+        binds.push(quote! {
+            #v
+            asm.push_word(::rulidity::U256::from(#slot));
+            asm.mstore();
+        });
+    }
+
+    // lowering the body in fresh scope (params as locals and no calldata)
+    let saved_locals = std::mem::replace(&mut state.locals, param_local);
+    let saved_offsets = std::mem::take(&mut state.param_offsets);
+    state.call_stack.push(name.clone());
+
+    let body_tail = if returns(&output) {
+        Tail::Leave
+    } else {
+        Tail::Void
+    };
+
+    let body = lower_stmts(&block.stmts, state, body_tail);
+
+    state.call_stack.pop();
+    state.locals = saved_locals;
+    state.param_offsets = saved_offsets;
+
+    let cleanup = if !want_value && returns(&output) {
+        quote! { asm.pop(); }
+    } else {
+        quote! {}
+    };
+
+    quote! {
+        #(#binds)*
+        #body
+        #cleanup
     }
 }
 
@@ -292,7 +396,7 @@ fn lower_emit(call: &syn::ExprCall, state: &mut Lower) -> proc_macro2::TokenStre
 /// if cond { .. } and if cond { .. } else { .. }
 fn lower_if(if_expr: &syn::ExprIf, state: &mut Lower) -> proc_macro2::TokenStream {
     let cond = lower_expression(&if_expr.cond, state);
-    let then_body = lower_stmts(&if_expr.then_branch.stmts, state, false);
+    let then_body = lower_stmts(&if_expr.then_branch.stmts, state, Tail::Void);
 
     match &if_expr.else_branch {
         Some((_, else_expr)) => {
@@ -307,7 +411,7 @@ fn lower_if(if_expr: &syn::ExprIf, state: &mut Lower) -> proc_macro2::TokenStrea
                 }
             };
 
-            let else_body = lower_stmts(else_stmts, state, false);
+            let else_body = lower_stmts(else_stmts, state, Tail::Void);
             quote! {
                 #cond
                 {
@@ -358,7 +462,7 @@ fn lower_local(local: &syn::Local, state: &mut Lower) -> proc_macro2::TokenStrea
     }
 }
 
-fn lower_expression(expr: &syn::Expr, state: &Lower) -> proc_macro2::TokenStream {
+fn lower_expression(expr: &syn::Expr, state: &mut Lower) -> proc_macro2::TokenStream {
     match expr {
         // integer literal
         syn::Expr::Lit(syn::ExprLit {
@@ -372,6 +476,16 @@ fn lower_expression(expr: &syn::Expr, state: &Lower) -> proc_macro2::TokenStream
         syn::Expr::Field(field) if is_self(&field.base) => {
             let slot = member_slot(&field.member, state.ctx.storage);
             quote! { asm.load_slot(::rulidity::U256::from(#slot)); }
+        }
+        // self.func() -> internal function, needs to be before matching for maps and arrays so that self.get() does not enter those arms
+        syn::Expr::MethodCall(mc)
+            if is_self(&mc.receiver)
+                && state
+                    .ctx
+                    .internal_functions
+                    .contains_key(&mc.method.to_string()) =>
+        {
+            lower_internal_call(mc, true, state)
         }
         // self.map.get(key) or self.array.get(idx)
         syn::Expr::MethodCall(mc) if mc.method == "get" => lower_get(mc, state),
@@ -396,7 +510,7 @@ fn lower_expression(expr: &syn::Expr, state: &Lower) -> proc_macro2::TokenStream
 }
 
 /// self.map.get(key) or self.array.get(idx)
-fn lower_get(mc: &syn::ExprMethodCall, state: &Lower) -> proc_macro2::TokenStream {
+fn lower_get(mc: &syn::ExprMethodCall, state: &mut Lower) -> proc_macro2::TokenStream {
     let sf = *self_field(&mc.receiver, state.ctx.storage);
     let base = sf.slot as u64;
     let args: Vec<&syn::Expr> = mc.args.iter().collect();
@@ -424,7 +538,7 @@ fn lower_get(mc: &syn::ExprMethodCall, state: &Lower) -> proc_macro2::TokenStrea
 }
 
 /// self.array.len()
-fn lower_len(mc: &syn::ExprMethodCall, state: &Lower) -> proc_macro2::TokenStream {
+fn lower_len(mc: &syn::ExprMethodCall, state: &mut Lower) -> proc_macro2::TokenStream {
     let sf = *self_field(&mc.receiver, state.ctx.storage);
     let base = sf.slot as u64;
     if sf.kind != FieldKind::Array {
@@ -438,7 +552,7 @@ fn lower_len(mc: &syn::ExprMethodCall, state: &Lower) -> proc_macro2::TokenStrea
 
 /// arithmetic and comparison operators. Comparisons use the MIRRORED opcode to
 /// avoid a SWAP (after `#l #r`, top-of-stack is the right operand).
-fn lower_binary(bin: &syn::ExprBinary, state: &Lower) -> proc_macro2::TokenStream {
+fn lower_binary(bin: &syn::ExprBinary, state: &mut Lower) -> proc_macro2::TokenStream {
     let l = lower_expression(&bin.left, state);
     let r = lower_expression(&bin.right, state);
     match &bin.op {
@@ -472,7 +586,7 @@ fn lower_binary(bin: &syn::ExprBinary, state: &Lower) -> proc_macro2::TokenStrea
 }
 
 /// a bare identifier: a local (MLOAD) shadows a param (CALLDATALOAD)
-fn lower_ident(p: &syn::ExprPath, state: &Lower) -> proc_macro2::TokenStream {
+fn lower_ident(p: &syn::ExprPath, state: &mut Lower) -> proc_macro2::TokenStream {
     let id = p.path.get_ident().unwrap();
     let name = id.to_string();
 

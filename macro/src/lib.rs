@@ -12,7 +12,7 @@ use abi::{
     abi_param_json, field_kind_of, is_mut_receiver, param_offset, params_of, signature_string,
 };
 use lower::lower_block;
-use model::{Ctx, EventDef, EventField, StorageField};
+use model::{Ctx, EventDef, EventField, InternalFn, StorageField};
 
 use crate::lower::lower_constructor;
 
@@ -32,6 +32,8 @@ pub fn contract(_attr: TokenStream, item: TokenStream) -> TokenStream {
         syn::Block,
         syn::punctuated::Punctuated<syn::FnArg, syn::token::Comma>,
     )> = None;
+
+    let mut internal_functions: HashMap<String, InternalFn> = HashMap::new();
 
     for item in &items {
         match item {
@@ -74,6 +76,16 @@ pub fn contract(_attr: TokenStream, item: TokenStream) -> TokenStream {
                                 panic!("Only one constructor is allowed");
                             }
                             constructor = Some((m.block.clone(), m.sig.inputs.clone()));
+                        } else {
+                            // those are internal functions
+                            internal_functions.insert(
+                                m.sig.ident.to_string(),
+                                InternalFn {
+                                    params: params_of(m.sig.inputs.clone()),
+                                    output: m.sig.output.clone(),
+                                    block: m.block.clone(),
+                                },
+                            );
                         }
                     }
                 }
@@ -97,6 +109,7 @@ pub fn contract(_attr: TokenStream, item: TokenStream) -> TokenStream {
     let ctx = Ctx {
         storage: &storage,
         events: &events,
+        internal_functions: &internal_functions,
     };
 
     let constructor_build = match &constructor {

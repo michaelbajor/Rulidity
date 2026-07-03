@@ -69,6 +69,10 @@ impl Asm {
             .add()
     }
 
+    pub fn pop(&mut self) -> &mut Self {
+        self.add_op(Op::Pop)
+    }
+
     pub fn code_size(&mut self) -> &mut Self {
         self.add_op(Op::CodeSize)
     }
