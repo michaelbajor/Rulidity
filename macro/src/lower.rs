@@ -482,6 +482,14 @@ fn lower_expression(expr: &syn::Expr, state: &mut Lower) -> proc_macro2::TokenSt
             let v: u64 = int.base10_parse().unwrap();
             quote! { asm.push_word(::rulidity::U256::from(#v)); }
         }
+        // bool literal
+        syn::Expr::Lit(syn::ExprLit {
+            lit: syn::Lit::Bool(b),
+            ..
+        }) => {
+            let v: u64 = if b.value { 1 } else { 0 };
+            quote! { asm.push_word(::rulidity::U256::from(#v)); }
+        }
         // self.field loads that field's storage slot
         syn::Expr::Field(field) if is_self(&field.base) => {
             let slot = member_slot(&field.member, state.ctx.storage);
