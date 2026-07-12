@@ -52,6 +52,7 @@ pub(crate) struct Lower<'a> {
     pub(crate) param_offsets: HashMap<String, u32>,
     pub(crate) next_local: u32,
     pub(crate) call_stack: Vec<String>, // recursion guard
+    pub(crate) ret_string: bool,
 }
 
 impl Lower<'_> {

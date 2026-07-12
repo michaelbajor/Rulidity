@@ -16,24 +16,54 @@ fn returns(output: &syn::ReturnType) -> bool {
     matches!(output, syn::ReturnType::Type(..))
 }
 
+fn returns_string(output: &syn::ReturnType) -> bool {
+    if let syn::ReturnType::Type(_, ty) = output
+        && let syn::Type::Path(tp) = &**ty
+        && let Some(seg) = tp.path.segments.last()
+    {
+        return seg.ident == "ShortString";
+    }
+
+    false
+}
+
+fn is_short_string_ty(ty: &syn::Type) -> bool {
+    matches!(ty, syn::Type::Path(tp) if tp.path.segments.last().is_some_and(|s| s.ident == "ShortString"))
+}
+
 pub(crate) fn lower_block<'a>(
     block: &syn::Block,
     output: &syn::ReturnType,
     ctx: &'a Ctx<'a>,
-    param_offsets: HashMap<String, u32>,
+    params: Vec<(syn::Ident, syn::Type)>,
 ) -> proc_macro2::TokenStream {
     let has_return = matches!(output, syn::ReturnType::Type(..));
 
     let mut state = Lower {
         ctx,
         locals: HashMap::new(),
-        param_offsets,
+        param_offsets: HashMap::new(),
         next_local: 0x80, // above 0x00-0x40 scratchpad
         call_stack: Vec::new(),
+        ret_string: returns_string(output),
     };
 
-    let tail = if has_return { Tail::Return } else { Tail::Void };
+    // each param owns one head word at 4 + 32 * i
+    // word aprams read directly from calldata (offset in param_offset)
+    // string params decode the offset/len/data at entry into a local variable
+    let mut prologue: Vec<proc_macro2::TokenStream> = Vec::new();
+    for (i, (name, ty)) in params.iter().enumerate() {
+        let head = 4 + 0x20 * i as u32;
+        if is_short_string_ty(ty) {
+            let slot = state.alloc_local();
+            state.locals.insert(name.to_string(), slot);
+            prologue.push(quote! { asm.decode_short_string_param(#head, #slot); });
+        } else {
+            state.param_offsets.insert(name.to_string(), head);
+        }
+    }
 
+    let tail = if has_return { Tail::Return } else { Tail::Void };
     let body = lower_stmts(&block.stmts, &mut state, tail);
 
     // fn with no return must halt, else it falls into the next body
@@ -43,7 +73,7 @@ pub(crate) fn lower_block<'a>(
         quote! {}
     };
 
-    quote! { #body #halt }
+    quote! { #(#prologue)* #body #halt }
 }
 
 /// Lower a constructor body. Args are appended after a creation code at deployment time.
@@ -60,26 +90,43 @@ pub(crate) fn lower_constructor<'a>(
         param_offsets: HashMap::new(),
         next_local: 0x80,
         call_stack: Vec::new(),
+        ret_string: false,
     };
 
     let n = params.len() as u64;
+    let s = params
+        .iter()
+        .filter(|(_, ty)| is_short_string_ty(ty))
+        .count() as u64;
+    let total_len = 32 * n + 64 * s;
 
+    let mut k = 0u64;
     let mut prologue: Vec<proc_macro2::TokenStream> = Vec::new();
 
-    for (i, (name, _ty)) in params.iter().enumerate() {
+    for (i, (name, ty)) in params.iter().enumerate() {
         let slot = state.alloc_local();
         state.locals.insert(name.to_string(), slot);
 
-        // arg i lives at CODESIZE - 32 * (n - 1)
-        let back = (n - i as u64) * 32;
-        prologue.push(quote! {
-            asm.push_word(::rulidity::U256::from(32u64)); // length
-            asm.push_word(::rulidity::U256::from(#back)); // 32 * (n - 1)
-            asm.code_size(); // CODESIZE
-            asm.sub();  // CODESIZE - 32 * (n - 1)
-            asm.push_word(::rulidity::U256::from(#slot)); // dest (local slot)
-            asm.code_copy();
-        });
+        if is_short_string_ty(ty) {
+            // tail is the last 64 * s bytes, the Kth string's [len][data] live there
+            let len_back = (64 * (s - k)) as u32;
+            let data_back = len_back - 32;
+            prologue.push(
+                quote! {asm.decode_short_string_constructor_arg(#len_back, #data_back, #slot);},
+            );
+            k += 1;
+        } else {
+            // arg i lives at args_start + 32 * i = CODESIZE - (total_len - 32 * i)
+            let back = total_len - 32 * i as u64;
+            prologue.push(quote! {
+                asm.push_word(::rulidity::U256::from(32u64)); // length
+                asm.push_word(::rulidity::U256::from(#back)); // 32 * (n - 1)
+                asm.code_size(); // CODESIZE
+                asm.sub();  // CODESIZE - 32 * (n - 1)
+                asm.push_word(::rulidity::U256::from(#slot)); // dest (local slot)
+                asm.code_copy();
+            });
+        }
     }
 
     let body = lower_stmts(&block.stmts, &mut state, Tail::Void);
@@ -151,9 +198,14 @@ fn lower_expr_stmt(expr: &syn::Expr, tail: Tail, state: &mut Lower) -> proc_macr
     match tail {
         Tail::Return => {
             let e = lower_expression(expr, state);
+            let encode = if state.ret_string {
+                quote! {asm.return_short_string();}
+            } else {
+                quote! {asm.return_word();}
+            };
             quote! {
                 #e
-                asm.return_word();
+                #encode
             }
         }
         Tail::Leave => lower_expression(expr, state),
@@ -490,6 +542,14 @@ fn lower_expression(expr: &syn::Expr, state: &mut Lower) -> proc_macro2::TokenSt
             let v: u64 = if b.value { 1 } else { 0 };
             quote! { asm.push_word(::rulidity::U256::from(#v)); }
         }
+        syn::Expr::Lit(syn::ExprLit {
+            lit: syn::Lit::Str(s),
+            ..
+        }) => {
+            let bytes = pack_short_string(&s.value());
+            let bs = bytes.iter();
+            quote! {asm.push_word(::rulidity::U256::from_be_slice(&[#(#bs),*]));}
+        }
         // self.field loads that field's storage slot
         syn::Expr::Field(field) if is_self(&field.base) => {
             let slot = member_slot(&field.member, state.ctx.storage);
@@ -545,6 +605,20 @@ fn lower_get(mc: &syn::ExprMethodCall, state: &mut Lower) -> proc_macro2::TokenS
         },
         Err(e) => e,
     }
+}
+
+fn pack_short_string(s: &str) -> [u8; 32] {
+    assert!(
+        s.len() <= 31,
+        "Short-string literals are max 31 bytes, got {}",
+        s.len()
+    );
+
+    let mut w = [0; 32];
+    w[..s.len()].copy_from_slice(s.as_bytes());
+    w[31] = (s.len() as u8) * 2;
+
+    w
 }
 
 /// What a storage value at a resolved slot is, and its inner type for peeling.

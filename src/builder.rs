@@ -98,6 +98,38 @@ impl Asm {
         self.add_op(Op::Pop)
     }
 
+    pub fn and(&mut self) -> &mut Self {
+        self.add_op(Op::And)
+    }
+
+    pub fn or(&mut self) -> &mut Self {
+        self.add_op(Op::Or)
+    }
+
+    pub fn not(&mut self) -> &mut Self {
+        self.add_op(Op::Not)
+    }
+
+    pub fn dup1(&mut self) -> &mut Self {
+        self.add_op(Op::Dup(1))
+    }
+
+    pub fn swap1(&mut self) -> &mut Self {
+        self.add_op(Op::Swap(1))
+    }
+
+    pub fn shr(&mut self) -> &mut Self {
+        self.add_op(Op::Shr)
+    }
+
+    pub fn shl(&mut self) -> &mut Self {
+        self.add_op(Op::Shl)
+    }
+
+    pub fn ret(&mut self) -> &mut Self {
+        self.add_op(Op::Return)
+    }
+
     pub fn code_size(&mut self) -> &mut Self {
         self.add_op(Op::CodeSize)
     }
@@ -122,9 +154,108 @@ impl Asm {
         self.add_op(Op::Balance)
     }
 
+    pub fn calldataload(&mut self) -> &mut Self {
+        self.add_op(Op::CallDataLoad)
+    }
+
     pub fn push_topic(&mut self, sig: &str) -> &mut Self {
         let h = keccak256(sig.as_bytes());
         self.push_bytes(&h.0)
+    }
+
+    pub fn return_short_string(&mut self) -> &mut Self {
+        self.dup1()
+            .push_u8(0xff)
+            .and()
+            .push_u8(0x1)
+            .shr()
+            .push_u8(0x20)
+            .mstore()
+            .push_u8(0xff)
+            .not()
+            .and()
+            .push_u8(0x40)
+            .mstore()
+            .push_u8(0x20)
+            .push_u8(0x00)
+            .mstore()
+            .push_u8(0x60)
+            .push_u8(0x00)
+            .ret()
+    }
+
+    pub fn decode_short_string_param(&mut self, head: u32, slot: u32) -> &mut Self {
+        let ok = self.fresh_label();
+        self.push_word(U256::from(head))
+            .calldataload() // [rel_offset]
+            .push_u8(0x04)
+            .add() // [abs] -> points at the length word
+            .dup1()
+            .calldataload() // [abs, len]
+            // guard: revert unless len < 32, else the length byte we fold in would clash
+            .dup1() // [abs, len, len]
+            .push_u8(32) // [abs, len, len, 32]
+            .add_op(Op::Gt) // [abs, len, (32 > len) = (len < 32)]
+            .add_op(Op::JumpI(ok)) // consume bool; skip the revert if len < 32
+            .revert_empty() // [abs, len] (only reached when len >= 32)
+            .add_op(Op::JumpDest(ok)) // [abs, len]
+            .swap1() // [len, abs]
+            .push_u8(0x20)
+            .add()
+            .calldataload() // [len, data] (data word at abs + 0x20)
+            .push_u8(0xff)
+            .not()
+            .and() // [len, data & ~0xff]
+            .swap1() // [data & ~0xff, len]
+            .push_u8(0x01)
+            .shl() // [data & ~0xff, len << 1]
+            .or() // [packed]
+            .push_word(U256::from(slot))
+            .mstore() // mem[slot] = packed
+    }
+
+    pub fn decode_short_string_constructor_arg(
+        &mut self,
+        len_back: u32,
+        data_back: u32,
+        slot: u32,
+    ) -> &mut Self {
+        let ok = self.fresh_label();
+
+        self.push_u8(0x20) // copy 32 bytes
+            .push_word(U256::from(len_back))
+            .code_size()
+            .sub() // src = CODESIZE - len_back
+            .push_u8(0x00)
+            .code_copy() // mem[0x00] = len word
+            .push_u8(0x20)
+            .push_word(U256::from(data_back))
+            .code_size()
+            .sub() // src = CODESIZE - data_back
+            .push_u8(0x20)
+            .code_copy(); // mem[0x20] = data word
+
+        // gaurd to revert unless len < 32
+        self.push_u8(0x00)
+            .mload() // [len]
+            .dup1()
+            .push_u8(32)
+            .add_op(Op::Gt) // [len, (32 > len) = (len < 32)]
+            .add_op(Op::JumpI(ok))
+            .revert_empty()
+            .add_op(Op::JumpDest(ok));
+
+        // pack: mem[0x20] & ~0xff | (len << 1)
+        self.push_u8(0x01)
+            .shl() // [len << 1]
+            .push_u8(0x20)
+            .mload() // [len << 1, data]
+            .push_u8(0xff)
+            .not()
+            .and() // [len << 1, data & ~0xff]
+            .or() // [packed]
+            .push_word(U256::from(slot))
+            .mstore() // mem[slot] = packed
     }
 }
 

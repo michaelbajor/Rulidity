@@ -1,5 +1,3 @@
-use std::collections::HashMap;
-
 use syn::{FnArg, Pat, token::Comma};
 
 use crate::model::FieldKind;
@@ -41,6 +39,7 @@ pub(crate) fn abi_type_of(ty: syn::Type) -> String {
         "U256" => "uint256",
         "Address" => "address",
         "bool" => "bool",
+        "ShortString" => "string",
         _ => panic!("Unsupported parameter type {segment_str}"), // @todo add more Solidity types
     };
 
@@ -62,18 +61,6 @@ pub(crate) fn signature_string(name: String, params: Vec<(syn::Ident, syn::Type)
     func_signature.push(')');
 
     func_signature
-}
-
-/// calculates calldata offset of function arguments. Currently only simple params are supported
-/// so each param takes 32 bytes
-pub(crate) fn param_offset(params: Vec<(syn::Ident, syn::Type)>) -> HashMap<String, u32> {
-    let mut map = HashMap::new();
-    for (i, (ident, _)) in params.iter().enumerate() {
-        let ident_str = ident.to_string();
-        map.insert(ident_str, 4 + 32 * i as u32);
-    }
-
-    map
 }
 
 pub(crate) fn field_kind_of(ty: &syn::Type) -> FieldKind {

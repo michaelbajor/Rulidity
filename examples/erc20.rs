@@ -25,13 +25,27 @@ mod erc20 {
         balances: Mapping<Address, U256>,
         allowances: Mapping<Address, Mapping<Address, U256>>,
         total_supply: U256,
+        name: ShortString,
+        symbol: ShortString,
     }
 
     impl ERC20 {
         #[constructor]
-        fn construct(&mut self, total_supply: U256) {
+        fn construct(&mut self, total_supply: U256, name: ShortString, symbol: ShortString) {
             self.total_supply = total_supply;
             self.balances.insert(msg_sender(), total_supply);
+            self.name = name;
+            self.symbol = symbol;
+        }
+
+        #[external]
+        pub fn symbol(&self) -> ShortString {
+            self.symbol
+        }
+
+        #[external]
+        pub fn name(&self) -> ShortString {
+            self.name
         }
 
         #[external]

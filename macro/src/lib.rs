@@ -8,9 +8,7 @@ mod abi;
 mod lower;
 mod model;
 
-use abi::{
-    abi_param_json, field_kind_of, is_mut_receiver, param_offset, params_of, signature_string,
-};
+use abi::{abi_param_json, field_kind_of, is_mut_receiver, params_of, signature_string};
 use lower::lower_block;
 use model::{Ctx, EventDef, EventField, InternalFn, StorageField};
 
@@ -141,8 +139,8 @@ pub fn contract(_attr: TokenStream, item: TokenStream) -> TokenStream {
         .iter()
         .map(|(name, output, block, inputs)| {
             let build_ident = format_ident!("build_{}", name);
-            let offsets = param_offset(params_of(inputs.clone()));
-            let body = lower_block(block, output, &ctx, offsets);
+            let params = params_of(inputs.clone());
+            let body = lower_block(block, output, &ctx, params);
             quote! {
                 fn #build_ident(asm: &mut ::rulidity::asm::Asm) {
                     #body

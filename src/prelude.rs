@@ -59,3 +59,5 @@ pub fn require(_cond: bool) {
 pub fn emit<E>(_event: E) {
     unimplemented!("Rulidity: emit works onchain. This is a stub for rust analyzer");
 }
+
+pub type ShortString = &'static str;
