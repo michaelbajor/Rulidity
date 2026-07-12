@@ -181,6 +181,7 @@ fn lower_expr_stmt(expr: &syn::Expr, tail: Tail, state: &mut Lower) -> proc_macr
         }
         syn::Expr::Call(call) if is_path(&call.func, "emit") => return lower_emit(call, state),
         syn::Expr::If(if_expr) => return lower_if(if_expr, state),
+        syn::Expr::While(while_expr) => return lower_while(while_expr, state),
         syn::Expr::MethodCall(mc)
             if matches!(tail, Tail::Void) && is_external_call(mc, state.ctx) =>
         {
@@ -202,6 +203,26 @@ fn lower_expr_stmt(expr: &syn::Expr, tail: Tail, state: &mut Lower) -> proc_macr
     // otherwise it's a value expression in tail position
     match tail {
         Tail::Return => {
+            if let syn::Expr::Tuple(t) = expr {
+                let stores: Vec<proc_macro2::TokenStream> = t
+                    .elems
+                    .iter()
+                    .enumerate()
+                    .map(|(i, e)| {
+                        let v = lower_expression(e, state);
+                        let off = 0x20 * i as u32;
+                        quote! {#v asm.push_word(::rulidity::U256::from(#off)); asm.mstore();}
+                    })
+                    .collect();
+                let total = 0x20 * t.elems.len() as u32;
+                return quote! {
+                    #(#stores)*
+                    asm.push_word(::rulidity::U256::from(#total)); // length
+                    asm.push_word(::rulidity::U256::from(0u64)); // offset
+                    asm.ret();
+                };
+            }
+
             let e = lower_expression(expr, state);
             let encode = if state.ret_string {
                 quote! {asm.return_short_string();}
@@ -300,6 +321,21 @@ fn lower_assign(assign: &syn::ExprAssign, state: &mut Lower) -> proc_macro2::Tok
             quote! {
                 #rhs
                 asm.store_slot(::rulidity::U256::from(#slot));
+            }
+        }
+        syn::Expr::Path(p) if p.path.get_ident().is_some() => {
+            let name = p.path.get_ident().unwrap().to_string();
+            match state.locals.get(&name) {
+                Some(&slot) => {
+                    let rhs = lower_expression(&assign.right, state);
+                    quote! {
+                        #rhs
+                        asm.push_word(::rulidity::U256::from(#slot));
+                        asm.mstore();
+                    }
+                }
+                None => syn::Error::new_spanned(&assign.left, "rulidity: cannot assign to this")
+                    .to_compile_error(),
             }
         }
         _ => syn::Error::new_spanned(&assign.left, "rulidity: unsupported assignment target")
@@ -507,6 +543,24 @@ fn lower_if(if_expr: &syn::ExprIf, state: &mut Lower) -> proc_macro2::TokenStrea
     }
 }
 
+fn lower_while(w: &syn::ExprWhile, state: &mut Lower) -> proc_macro2::TokenStream {
+    let cond = lower_expression(&w.cond, state);
+    let body = lower_stmts(&w.body.stmts, state, Tail::Void);
+
+    quote! {
+        let top = asm.fresh_label();
+        let end = asm.fresh_label();
+
+        asm.add_op(::rulidity::asm::Op::JumpDest(top));
+        #cond
+        asm.add_op(::rulidity::asm::Op::IsZero);
+        asm.add_op(::rulidity::asm::Op::JumpI(end)); // exit if !cond
+        #body
+        asm.add_op(::rulidity::asm::Op::Jump(top));  // loop back
+        asm.add_op(::rulidity::asm::Op::JumpDest(end));
+    }
+}
+
 /// let x = expr;  stores the value in a fresh local slot
 fn lower_local(local: &syn::Local, state: &mut Lower) -> proc_macro2::TokenStream {
     let name = ident_of_pat(local.pat.clone());
@@ -582,13 +636,22 @@ fn lower_expression(expr: &syn::Expr, state: &mut Lower) -> proc_macro2::TokenSt
         syn::Expr::Binary(bin) => lower_binary(bin, state),
         // (expr)
         syn::Expr::Paren(p) => lower_expression(&p.expr, state),
-        // msg_sender()  or  U256::from(<int>)
+        // msg_sender(), block_timestamp()  or  U256::from(<int>)
         syn::Expr::Call(call) => {
-            if let syn::Expr::Path(p) = &*call.func
-                && p.path.is_ident("msg_sender")
-            {
-                return quote! { asm.msg_sender(); };
+            if let syn::Expr::Path(p) = &*call.func {
+                if p.path.is_ident("msg_sender") {
+                    return quote! { asm.msg_sender(); };
+                }
+
+                if p.path.is_ident("block_timestamp") {
+                    return quote! { asm.block_timestamp(); };
+                }
+
+                if p.path.is_ident("address_this") {
+                    return quote! { asm.address_this(); };
+                }
             }
+
             lower_from_call(call)
         }
         syn::Expr::Path(p) if p.path.get_ident().is_some() => lower_ident(p, state),
@@ -765,8 +828,8 @@ fn lower_len(mc: &syn::ExprMethodCall, state: &mut Lower) -> proc_macro2::TokenS
     }
 }
 
-/// arithmetic and comparison operators. Comparisons use the MIRRORED opcode to
-/// avoid a SWAP (after `#l #r`, top-of-stack is the right operand).
+/// arithmetic and comparison operators. Comparisons use the mirrored opcode to
+/// avoid a SWAP (after #l #r, top-of-stack is the right operand).
 fn lower_binary(bin: &syn::ExprBinary, state: &mut Lower) -> proc_macro2::TokenStream {
     let l = lower_expression(&bin.left, state);
     let r = lower_expression(&bin.right, state);
@@ -796,6 +859,13 @@ fn lower_binary(bin: &syn::ExprBinary, state: &mut Lower) -> proc_macro2::TokenS
             asm.add_op(::rulidity::asm::Op::Gt);
             asm.add_op(::rulidity::asm::Op::IsZero);
         },
+        syn::BinOp::Div(_) => quote! {#r #l asm.add_op(::rulidity::asm::Op::Div); },
+        syn::BinOp::Rem(_) => quote! {#r #l asm.add_op(::rulidity::asm::Op::Mod); },
+        syn::BinOp::BitAnd(_) => quote! { #l #r asm.add_op(::rulidity::asm::Op::And); },
+        syn::BinOp::BitOr(_) => quote! { #l #r asm.add_op(::rulidity::asm::Op::Or); },
+        syn::BinOp::BitXor(_) => quote! { #l #r asm.add_op(::rulidity::asm::Op::Xor); },
+        syn::BinOp::Shl(_) => quote! { #l #r asm.add_op(::rulidity::asm::Op::Shl); },
+        syn::BinOp::Shr(_) => quote! { #l #r asm.add_op(::rulidity::asm::Op::Shr); },
         _ => syn::Error::new_spanned(bin, "rulidity: unsupported operator").to_compile_error(),
     }
 }

@@ -198,7 +198,12 @@ pub fn contract(_attr: TokenStream, item: TokenStream) -> TokenStream {
 
             let outputs_json = match output {
                 syn::ReturnType::Default => String::new(),
-                syn::ReturnType::Type(_, ty) => abi_param_json("", ty, None),
+                syn::ReturnType::Type(_, ty) => {
+                    match &**ty {
+                        syn::Type::Tuple(t) => t.elems.iter().map(|e| abi_param_json("", e, None)).collect::<Vec<_>>().join(","),
+                        _ => abi_param_json("", ty, None),
+                    }
+                },
             };
             let mutability = if is_mut_receiver(inputs) {
                 "nonpayable"

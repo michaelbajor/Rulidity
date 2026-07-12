@@ -146,6 +146,14 @@ impl Asm {
         self.add_op(Op::Caller)
     }
 
+    pub fn block_timestamp(&mut self) -> &mut Self {
+        self.add_op(Op::Timestamp)
+    }
+
+    pub fn address_this(&mut self) -> &mut Self {
+        self.add_op(Op::Address)
+    }
+
     pub fn tx_origin(&mut self) -> &mut Self {
         self.add_op(Op::Origin)
     }

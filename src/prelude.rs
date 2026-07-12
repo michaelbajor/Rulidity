@@ -52,6 +52,16 @@ pub fn msg_sender() -> Address {
     unimplemented!("Rulidity: msg.sender exists only on-chain. This is stub impl for rust analyzer")
 }
 
+pub fn block_timestamp() -> U256 {
+    unimplemented!("Rulidity: msg.sender exists only on-chain. This is stub impl for rust analyzer")
+}
+
+pub fn address_this() -> Address {
+    unimplemented!(
+        "Rulidity: address(this) exists only on-chain. This is stub impl for rust analyzer"
+    )
+}
+
 pub fn require(_cond: bool) {
     unimplemented!("Rulidity: require executes onchain. This is stub for rust analyzer")
 }
