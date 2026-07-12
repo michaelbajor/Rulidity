@@ -224,10 +224,20 @@ mod tests {
         };
 
         assert_eq!(
-            U256::from_be_slice(&send(Bytes::from(supply_sel.to_vec()), 1).into_output().unwrap()),
+            U256::from_be_slice(
+                &send(Bytes::from(supply_sel.to_vec()), 1)
+                    .into_output()
+                    .unwrap()
+            ),
             supply
         );
-        assert_eq!(read_string(send(Bytes::from(name_sel.to_vec()), 2)), "TEST_TOKEN");
-        assert_eq!(read_string(send(Bytes::from(symbol_sel.to_vec()), 3)), "TST");
+        assert_eq!(
+            read_string(send(Bytes::from(name_sel.to_vec()), 2)),
+            "TEST_TOKEN"
+        );
+        assert_eq!(
+            read_string(send(Bytes::from(symbol_sel.to_vec()), 3)),
+            "TST"
+        );
     }
 }
