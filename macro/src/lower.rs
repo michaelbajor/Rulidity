@@ -182,6 +182,11 @@ fn lower_expr_stmt(expr: &syn::Expr, tail: Tail, state: &mut Lower) -> proc_macr
         syn::Expr::Call(call) if is_path(&call.func, "emit") => return lower_emit(call, state),
         syn::Expr::If(if_expr) => return lower_if(if_expr, state),
         syn::Expr::MethodCall(mc)
+            if matches!(tail, Tail::Void) && is_external_call(mc, state.ctx) =>
+        {
+            return lower_external_call(mc, false, state);
+        }
+        syn::Expr::MethodCall(mc)
             if matches!(tail, Tail::Void)
                 && is_self(&mc.receiver)
                 && state
@@ -565,6 +570,10 @@ fn lower_expression(expr: &syn::Expr, state: &mut Lower) -> proc_macro2::TokenSt
         {
             lower_internal_call(mc, true, state)
         }
+        // Calls to external contracts, IERC20::at(addr).balanceOf(..)
+        syn::Expr::MethodCall(mc) if is_external_call(mc, state.ctx) => {
+            lower_external_call(mc, true, state)
+        }
         // self.map.get(key) or self.array.get(idx)
         syn::Expr::MethodCall(mc) if mc.method == "get" => lower_get(mc, state),
         // self.array.len()
@@ -821,6 +830,118 @@ fn is_path(e: &syn::Expr, name: &str) -> bool {
 
 fn is_self(e: &syn::Expr) -> bool {
     is_path(e, "self")
+}
+
+fn is_external_call(mc: &syn::ExprMethodCall, ctx: &Ctx) -> bool {
+    external_call_target(mc, ctx).is_some()
+}
+
+// returns (interface name, address expression) for IFace::at(addr).method(..)
+fn external_call_target(mc: &syn::ExprMethodCall, ctx: &Ctx) -> Option<(String, syn::Expr)> {
+    let syn::Expr::Call(call) = &*mc.receiver else {
+        return None;
+    };
+    let syn::Expr::Path(p) = &*call.func else {
+        return None;
+    };
+
+    let segs = &p.path.segments;
+    if segs.len() == 2 && segs[1].ident == "at" && call.args.len() == 1 {
+        let iface = segs[0].ident.to_string();
+        if ctx.interfaces.contains_key(&iface) {
+            return Some((iface, call.args[0].clone()));
+        }
+    }
+
+    None
+}
+
+fn lower_external_call(
+    mc: &syn::ExprMethodCall,
+    want_value: bool,
+    state: &mut Lower,
+) -> proc_macro2::TokenStream {
+    let (iface, addr_expr) = match external_call_target(mc, state.ctx) {
+        Some(t) => t,
+        None => return syn::Error::new_spanned(mc, "not an external call").to_compile_error(),
+    };
+
+    let method = mc.method.to_string();
+    let (sig, nargs, has_return, mutable) = {
+        let m = &state.ctx.interfaces[&iface].methods[&method];
+        let has_ret = matches!(m.output, syn::ReturnType::Type(..));
+        (m.sig.clone(), m.params.len(), has_ret, m.mutable)
+    };
+
+    if mc.args.len() != nargs {
+        return syn::Error::new_spanned(mc, "wrong number of arguments").to_compile_error();
+    }
+
+    let buf = state.alloc_calldata(nargs);
+    // for each arg -> evaluate, store at by + 4 + 0x20 * i (one value on the stack at a time)
+    let arg_stores: Vec<proc_macro2::TokenStream> = mc
+        .args
+        .iter()
+        .enumerate()
+        .map(|(i, arg)| {
+            let v = lower_expression(arg, state);
+            let off = buf + 4 + 0x20 * i as u32;
+            quote! {
+                #v
+                asm.push_word(::rulidity::U256::from(#off));
+                asm.mstore();
+            }
+        })
+        .collect();
+
+    let addr_code = lower_expression(&addr_expr, state);
+    let args_len = 4 + 0x20 * nargs as u32;
+    let ret_len: u32 = if want_value && has_return { 0x20 } else { 0 };
+
+    // CALL carries a value operand, STATICCALL does not
+    let (call_op, value_push) = if mutable {
+        (
+            quote! { ::rulidity::asm::Op::Call },
+            quote! { asm.push_word(::rulidity::U256::from(0u64)); },
+        )
+    } else {
+        (quote! { ::rulidity::asm::Op::StaticCall }, quote! {})
+    };
+
+    let load = if want_value && has_return {
+        quote! {
+            asm.push_word(::rulidity::U256::from(#buf));
+            asm.mload();
+        }
+    } else {
+        quote! {}
+    };
+
+    quote! {
+        // calldata = selector . args, written at [buf ..]
+        asm.push_selector(#sig);
+        asm.push_word(::rulidity::U256::from(#buf));
+        asm.mstore();
+        #(#arg_stores)*
+
+        // operands, pushed in reverse of the CALL pop order
+        asm.push_word(::rulidity::U256::from(#ret_len)); // retLength
+        asm.push_word(::rulidity::U256::from(#buf)); // retOffset
+        asm.push_word(::rulidity::U256::from(#args_len)); // argsLength
+        asm.push_word(::rulidity::U256::from(#buf)); // argsOffset
+        #value_push // value (CALL only)
+        #addr_code // target address
+        asm.add_op(::rulidity::asm::Op::Gas); // forward all remaining gas
+        asm.add_op(#call_op);
+
+        // bubble failure
+        let ok = asm.fresh_label();
+        asm.add_op(::rulidity::asm::Op::JumpI(ok));
+        asm.revert_empty();
+        asm.add_op(::rulidity::asm::Op::JumpDest(ok));
+
+        #load
+    }
 }
 
 fn member_slot(m: &syn::Member, storage: &HashMap<syn::Ident, StorageField>) -> u64 {

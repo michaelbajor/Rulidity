@@ -34,6 +34,19 @@ pub(crate) struct StorageField {
     pub(crate) kind: FieldKind,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct InterfaceMethod {
+    pub(crate) sig: String, // "transfer(address,uint256)"
+    pub(crate) params: Vec<(syn::Ident, syn::Type)>,
+    pub(crate) output: syn::ReturnType,
+    pub(crate) mutable: bool, // &self -> STATICCAL, &mut self -> CALL
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct InterfaceDef {
+    pub(crate) methods: std::collections::HashMap<String, InterfaceMethod>,
+}
+
 /// Everything that stays constant while lowering a whole contract.
 pub(crate) struct Ctx<'a> {
     pub(crate) storage: &'a HashMap<syn::Ident, StorageField>,
@@ -42,6 +55,7 @@ pub(crate) struct Ctx<'a> {
     // declared type of each storage field, so mapping/array chains can be
     // peeled a level at a time (e.g. Mapping<K, Mapping<K2, V>>)
     pub(crate) field_types: &'a HashMap<syn::Ident, syn::Type>,
+    pub(crate) interfaces: &'a HashMap<String, InterfaceDef>,
 }
 
 /// Per function body state. `locals` and `param_offsets` describe the current
@@ -61,5 +75,13 @@ impl Lower<'_> {
         let offset = self.next_local;
         self.next_local += 0x20;
         offset
+    }
+
+    // reserve a continous calldata buffer
+    // 1 word for the selector + 1 word per arg
+    pub(crate) fn alloc_calldata(&mut self, nargs: usize) -> u32 {
+        let base = self.next_local;
+        self.next_local += 0x20 * (1 + nargs as u32);
+        base
     }
 }

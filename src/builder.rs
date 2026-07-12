@@ -257,6 +257,13 @@ impl Asm {
             .push_word(U256::from(slot))
             .mstore() // mem[slot] = packed
     }
+
+    pub fn push_selector(&mut self, sig: &str) -> &mut Self {
+        let h = keccak256(sig.as_bytes());
+        let mut w = [0u8; 32];
+        w[..4].copy_from_slice(&h[..4]);
+        self.push_bytes(&w)
+    }
 }
 
 #[cfg(test)]

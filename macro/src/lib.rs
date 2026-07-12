@@ -2,7 +2,7 @@ use std::collections::HashMap;
 
 use proc_macro::TokenStream;
 use quote::{format_ident, quote};
-use syn::{ImplItem, Item, ItemMod, parse_macro_input};
+use syn::{ImplItem, Item, ItemMod, TraitItem, parse_macro_input};
 
 mod abi;
 mod lower;
@@ -12,7 +12,10 @@ use abi::{abi_param_json, field_kind_of, is_mut_receiver, params_of, signature_s
 use lower::lower_block;
 use model::{Ctx, EventDef, EventField, InternalFn, StorageField};
 
-use crate::lower::lower_constructor;
+use crate::{
+    lower::lower_constructor,
+    model::{InterfaceDef, InterfaceMethod},
+};
 
 /// #[contract] mod my_contract { ... }
 #[proc_macro_attribute]
@@ -32,6 +35,8 @@ pub fn contract(_attr: TokenStream, item: TokenStream) -> TokenStream {
     )> = None;
 
     let mut internal_functions: HashMap<String, InternalFn> = HashMap::new();
+
+    let mut interfaces: HashMap<String, InterfaceDef> = HashMap::new();
 
     for item in &items {
         match item {
@@ -88,6 +93,26 @@ pub fn contract(_attr: TokenStream, item: TokenStream) -> TokenStream {
                     }
                 }
             }
+            Item::Trait(t) if has_attr(&t.attrs, "interface") => {
+                let mut methods = HashMap::new();
+                for it in &t.items {
+                    if let TraitItem::Fn(m) = it {
+                        let params = params_of(m.sig.inputs.clone());
+                        let sig = signature_string(m.sig.ident.to_string(), params.clone());
+
+                        methods.insert(
+                            m.sig.ident.to_string(),
+                            InterfaceMethod {
+                                sig,
+                                params,
+                                output: m.sig.output.clone(),
+                                mutable: is_mut_receiver(&m.sig.inputs),
+                            },
+                        );
+                    }
+                }
+                interfaces.insert(t.ident.to_string(), InterfaceDef { methods });
+            }
             _ => {}
         }
     }
@@ -112,6 +137,7 @@ pub fn contract(_attr: TokenStream, item: TokenStream) -> TokenStream {
         events: &events,
         internal_functions: &internal_functions,
         field_types: &field_types,
+        interfaces: &interfaces,
     };
 
     let constructor_build = match &constructor {
@@ -212,7 +238,13 @@ pub fn contract(_attr: TokenStream, item: TokenStream) -> TokenStream {
     let abi_str = format!("[{}]", abi_entries.join(","));
 
     // re-emit the user's items as real Rust, minus the helper attributes
-    let real_items: Vec<proc_macro2::TokenStream> = items.iter().map(strip_helper_attrs).collect();
+    let real_items: Vec<proc_macro2::TokenStream> = items
+        .iter()
+        .map(|item| match item {
+            Item::Trait(t) if has_attr(&t.attrs, "interface") => interface_items(t),
+            other => strip_helper_attrs(other),
+        })
+        .collect();
 
     let mod_name = &module.ident;
 
@@ -241,6 +273,25 @@ pub fn contract(_attr: TokenStream, item: TokenStream) -> TokenStream {
 
 fn has_attr(attrs: &[syn::Attribute], name: &str) -> bool {
     attrs.iter().any(|attr| attr.path().is_ident(name))
+}
+
+fn interface_items(t: &syn::ItemTrait) -> proc_macro2::TokenStream {
+    let name = &t.ident;
+    let stubs = t.items.iter().filter_map(|it| match it {
+        syn::TraitItem::Fn(m) => {
+            let sig = &m.sig; // fn transfer(&mut self, to: Address, amount: U256)
+            Some(quote! {pub #sig {::core::unimplemented!()}})
+        }
+        _ => None,
+    });
+
+    quote! {
+        pub struct #name(pub ::rulidity::prelude::Address);
+        impl #name {
+            pub fn at(addr: ::rulidity::prelude::Address) -> Self {#name(addr)}
+            #(#stubs)*
+        }
+    }
 }
 
 /// Clone an item and remove the #[storage] / #[external] helper attributes,
