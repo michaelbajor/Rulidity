@@ -496,15 +496,19 @@ fn lower_emit(call: &syn::ExprCall, state: &mut Lower) -> proc_macro2::TokenStre
     }
 }
 
-/// if cond { .. } and if cond { .. } else { .. }
+/// if cond { .. } and if cond { .. } else { .. } and else if {}
 fn lower_if(if_expr: &syn::ExprIf, state: &mut Lower) -> proc_macro2::TokenStream {
     let cond = lower_expression(&if_expr.cond, state);
     let then_body = lower_stmts(&if_expr.then_branch.stmts, state, Tail::Void);
 
     match &if_expr.else_branch {
         Some((_, else_expr)) => {
-            let else_stmts = match &**else_expr {
-                syn::Expr::Block(b) => &b.block.stmts,
+            let else_body = match &**else_expr {
+                syn::Expr::Block(b) => {
+                    let stmts = &b.block.stmts;
+                    lower_stmts(stmts, state, Tail::Void)
+                }
+                syn::Expr::If(inner) => lower_if(inner, state),
                 _ => {
                     return syn::Error::new_spanned(
                         else_expr,
@@ -514,7 +518,6 @@ fn lower_if(if_expr: &syn::ExprIf, state: &mut Lower) -> proc_macro2::TokenStrea
                 }
             };
 
-            let else_body = lower_stmts(else_stmts, state, Tail::Void);
             quote! {
                 #cond
                 {
